@@ -73,7 +73,7 @@ def save_step_data_to_csv(regression_outputs, initial_length, final_length, glob
 
 def log_simplified_metrics_to_wandb(regression_outputs, initial_length, final_length, global_step, epoch, frozen_layers=None):
     """
-    Log only beginning and midpoint metrics to wandb with simplified naming.
+    Log only start and mid training metrics to wandb with simplified naming.
     Only logs for active (non-frozen) layers.
     Args:
         regression_outputs: List of dictionaries with regression outputs for each step
@@ -128,6 +128,9 @@ def log_simplified_metrics_to_wandb(regression_outputs, initial_length, final_le
                 
                 # Use simplified naming convention
                 metrics_to_log[f"train_layer_{layer_idx}_loss_{pos_name}"] = error
+    
+    # Add total generated length
+    metrics_to_log["total_generated_length"] = final_length
     
     # Log to wandb if we have metrics
     if metrics_to_log:
@@ -319,31 +322,13 @@ def main():
             
             # Get current learning rate
             current_lr = optimizer.param_groups[0]['lr']
-            
             print(f"  Generated {final_length} tokens. Loss: {loss.item():.4f}, LR: {current_lr:.6f}")
             
-            # Log predictions from the last step
-            last_step_preds = {}
-            if regression_outputs:
-                last_preds = regression_outputs[-1]
-                for layer, pred in last_preds.items():
-                    last_step_preds[f"final_{layer}_pred"] = pred.item()
-            
-            # Format layer losses for logging
-            log_layer_losses = {f"train_loss_{layer}": val for layer, val in layer_losses.items()}
-            log_frozen_status = {f"frozen_{layer}": status for layer, status in frozen_layers.items()}
-            
-            # Log learning rate
+            # Log only learning rate to wandb
             wandb.log({
-                "learning_rate": current_lr,
-                "train_loss": loss.item(),
-                "actual_length": final_length,
-                **last_step_preds,
-                **log_layer_losses,
-                **log_frozen_status,
-                "epoch": epoch + 1,
+                "lr": current_lr,
                 "step": global_step,
-                "active_heads": sum(1 for status in frozen_layers.values() if not status)
+                "epoch": epoch + 1
             })
             
             samples_since_validation += 1
@@ -401,18 +386,6 @@ def main():
                     layer_key = f"layer_{i}"
                     metrics_row.append(f"{'Yes' if frozen_layers[layer_key] else 'No'}")
                 print(" | ".join(metrics_row))
-                
-                # Log mid-epoch stats
-                wandb.log({
-                    "epoch_avg_train_loss": curr_avg_train_loss,
-                    "epoch_avg_val_loss": avg_val_loss,
-                    **{f"epoch_avg_train_{layer}": loss for layer, loss in curr_avg_train_layer_losses.items()},
-                    **{f"epoch_avg_val_{layer}": loss for layer, loss in avg_val_layer_losses.items()},
-                    **log_frozen_status,
-                    "epoch": epoch + 1,
-                    "step": global_step,
-                    "active_heads": sum(1 for status in frozen_layers.values() if not status)
-                })
                 
                 # Check for overall model improvement
                 if avg_val_loss < best_overall_val_loss:
@@ -544,21 +517,6 @@ def main():
                 layer_key = f"layer_{i}"
                 metrics_row.append(f"{'Yes' if frozen_layers[layer_key] else 'No'}")
             print(" | ".join(metrics_row))
-            
-            # Log epoch averages
-            log_frozen_status = {f"frozen_{layer}": status for layer, status in frozen_layers.items()}
-            wandb.log({
-                "epoch_avg_train_loss": avg_train_loss,
-                "epoch_avg_val_loss": avg_val_loss,
-                "learning_rate": current_lr,
-                **{f"epoch_avg_train_{layer}": loss for layer, loss in avg_train_layer_losses.items()},
-                **{f"epoch_avg_val_{layer}": loss for layer, loss in avg_val_layer_losses.items()},
-                **log_frozen_status,
-                "epoch": epoch + 1,
-                "step": global_step,
-                "completed_epoch": True,
-                "active_heads": sum(1 for status in frozen_layers.values() if not status)
-            })
             
             # Check for overall model improvement
             if avg_val_loss < best_overall_val_loss:

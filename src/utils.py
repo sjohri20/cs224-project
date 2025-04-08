@@ -57,65 +57,6 @@ def save_validation_data_to_csv(regression_outputs, initial_length, final_length
     
     return filename
 
-def log_validation_simplified_metrics(regression_outputs, initial_length, final_length, global_step, epoch, prompt_idx, frozen_layers=None):
-    """
-    Log only start and mid validation metrics to wandb with simplified naming.
-    Only logs for active (non-frozen) layers.
-    """
-    if not regression_outputs or len(regression_outputs) == 0:
-        return
-    
-    if frozen_layers is None:
-        frozen_layers = {}
-    
-    num_steps = len(regression_outputs)
-    
-    # Only log metrics at the beginning and midpoint
-    positions = []
-    position_names = []
-    
-    # Beginning (first token)
-    if num_steps > 0:
-        positions.append(0)
-        position_names.append("start")
-    
-    # Midpoint token position
-    if num_steps > 1:
-        midpoint_idx = num_steps // 2
-        positions.append(midpoint_idx)
-        position_names.append("mid")
-    
-    # Prepare metrics to log
-    metrics_to_log = {}
-    
-    # Extract metrics for each position
-    for idx, (pos_idx, pos_name) in enumerate(zip(positions, position_names)):
-        if pos_idx < len(regression_outputs):
-            step_preds = regression_outputs[pos_idx]
-            current_position = initial_length + pos_idx
-            remaining_tokens = final_length - current_position
-            
-            # Calculate error for each layer
-            for layer, pred in step_preds.items():
-                # Skip frozen layers
-                layer_idx = int(layer.split('_')[1])
-                if frozen_layers.get(f"layer_{layer_idx}", False):
-                    continue
-                
-                pred_value = pred.item() if isinstance(pred.item(), (int, float)) else pred.item()[0]
-                error = abs(pred_value - remaining_tokens)
-                
-                # Use simplified naming convention
-                metrics_to_log[f"val_layer_{layer_idx}_loss_{pos_name}"] = error
-    
-    # Log to wandb if we have metrics
-    if metrics_to_log:
-        metrics_to_log["step"] = global_step
-        metrics_to_log["epoch"] = epoch
-        wandb.log(metrics_to_log)
-    
-    return
-
 def save_generation_to_file(file_path, data):
     """
     Save generation data to a JSONL file.
@@ -242,6 +183,11 @@ def run_validation_with_save(model, tokenizer, val_prompts, device, max_new_toke
     val_layer_losses = {f"layer_{i}": 0.0 for i in range(model.num_layers)}
     val_generations = []
     
+    # Collect metrics across entire validation set before logging
+    # Format: {layer_idx: {position_name: [errors]}}
+    validation_metrics = {}
+    total_length_sum = 0
+    
     with torch.no_grad():  # No gradients needed for validation
         for idx, row in val_prompts.iterrows():
             prompt = row['prompt']
@@ -262,19 +208,51 @@ def run_validation_with_save(model, tokenizer, val_prompts, device, max_new_toke
             
             generated_text = tokenizer.decode(generated_ids[0])
             final_length = generated_ids.size(1)
+            total_length_sum += final_length
             
-            # Log simplified validation metrics (beginning and midpoint)
-            log_validation_simplified_metrics(
-                regression_outputs,
-                initial_length,
-                final_length,
-                global_step,
-                epoch + 1,
-                idx,
-                frozen_layers
-            )
+            # Collect metrics for this prompt instead of logging immediately
+            num_steps = len(regression_outputs)
+            positions = []
+            position_names = []
             
-            # Save detailed data to CSV
+            # Beginning (first token)
+            if num_steps > 0:
+                positions.append(0)
+                position_names.append("start")
+            
+            # Midpoint token position
+            if num_steps > 1:
+                midpoint_idx = num_steps // 2
+                positions.append(midpoint_idx)
+                position_names.append("mid")
+            
+            # Extract metrics for each position
+            for idx, (pos_idx, pos_name) in enumerate(zip(positions, position_names)):
+                if pos_idx < len(regression_outputs):
+                    step_preds = regression_outputs[pos_idx]
+                    current_position = initial_length + pos_idx
+                    remaining_tokens = final_length - current_position
+                    
+                    # Calculate error for each layer
+                    for layer, pred in step_preds.items():
+                        # Skip frozen layers
+                        layer_idx = int(layer.split('_')[1])
+                        if frozen_layers and frozen_layers.get(f"layer_{layer_idx}", False):
+                            continue
+                        
+                        pred_value = pred.item() if isinstance(pred.item(), (int, float)) else pred.item()[0]
+                        error = abs(pred_value - remaining_tokens)
+                        
+                        # Initialize nested dictionary if needed
+                        if layer_idx not in validation_metrics:
+                            validation_metrics[layer_idx] = {}
+                        if pos_name not in validation_metrics[layer_idx]:
+                            validation_metrics[layer_idx][pos_name] = []
+                            
+                        # Collect error for aggregation
+                        validation_metrics[layer_idx][pos_name].append(error)
+            
+            # Save detailed data to CSV but don't log to wandb yet
             csv_filename = save_validation_data_to_csv(
                 regression_outputs,
                 initial_length,
@@ -334,21 +312,31 @@ def run_validation_with_save(model, tokenizer, val_prompts, device, max_new_toke
             save_generation_to_file(output_file, generation_data)
             val_generations.append(generation_data)
             
-            # Log validation metrics
-            log_val_layer_losses = {f"val_loss_{layer}": val 
-                                   for layer, val in avg_step_layer_losses.items()}
-            
-            wandb.log({
-                "val_loss": val_loss,
-                "val_actual_length": final_length,
-                **log_val_layer_losses,
-                "step": global_step,
-            })
+            # Log validation metrics - REMOVED, will log aggregated metrics at the end
     
     # Calculate average validation losses
     avg_val_loss = total_val_loss / len(val_prompts)
     avg_val_layer_losses = {layer: loss / len(val_prompts) 
                            for layer, loss in val_layer_losses.items()}
+    
+    # Now log aggregated validation metrics across all prompts
+    avg_length = total_length_sum / len(val_prompts) if val_prompts else 0
+    
+    metrics_to_log = {
+        "total_generated_length": avg_length,
+        "step": global_step,
+        "epoch": epoch + 1,
+    }
+    
+    # Add average metrics for each layer and position
+    for layer_idx, positions in validation_metrics.items():
+        for pos_name, errors in positions.items():
+            if errors:  # Only log if we have data
+                avg_error = sum(errors) / len(errors)
+                metrics_to_log[f"val_layer_{layer_idx}_loss_{pos_name}"] = avg_error
+    
+    # Log to wandb
+    wandb.log(metrics_to_log)
     
     print(f"Average validation loss: {avg_val_loss:.4f}")
     
