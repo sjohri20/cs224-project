@@ -6,7 +6,8 @@ from .utils import top_k_top_p_filtering
 
 class RegressionHead(nn.Module):
     """
-    A simple regression head that takes in an input vector and outputs a single scalar.
+    A simple regression head that takes in an input vector and outputs a single scalar
+    representing the predicted number of remaining tokens to be generated.
     The input dimension can be the hidden state dimension or hidden state plus one (if including token count).
     """
     def __init__(self, input_dim):
@@ -23,7 +24,8 @@ class ModelWithRegressorForLM(nn.Module):
     Wraps a causal LM and attaches a regression head to each transformer block.
     At each autoregressive generation step, the model extracts the last-token hidden state
     from every block, optionally concatenates the current token count, and passes it through
-    its corresponding regression head to predict the final total output length.
+    its corresponding regression head to predict the remaining number of tokens to be generated
+    (rather than the final total output length).
     
     The language model is frozen (eval mode) so that only the regression heads are updated.
     """
@@ -45,7 +47,8 @@ class ModelWithRegressorForLM(nn.Module):
         """
         Autoregressively generates tokens while collecting regression outputs.
         At each step, each regression head receives the last token's hidden state,
-        optionally concatenated with the current sequence length, and outputs a prediction.
+        optionally concatenated with the current sequence length, and outputs a prediction
+        of the remaining number of tokens to be generated (not the total sequence length).
         """
         device = input_ids.device
 
@@ -72,6 +75,7 @@ class ModelWithRegressorForLM(nn.Module):
                         input_to_regressor = torch.cat([hidden_state, token_count_tensor], dim=-1)
                     else:
                         input_to_regressor = hidden_state
+                    # Predict remaining tokens (instead of total length)
                     reg_out = self.regression_heads[i](input_to_regressor)  # [batch_size, 1]
                     step_regression_outputs[f"layer_{i}"] = reg_out
                 regression_outputs_per_step.append(step_regression_outputs)
@@ -124,6 +128,7 @@ class ModelWithRegressorForLM(nn.Module):
                             input_to_regressor = torch.cat([hidden_state, token_count_tensor], dim=-1)
                         else:
                             input_to_regressor = hidden_state
+                        # Predict remaining tokens (instead of total length)
                         reg_out = self.regression_heads[i](input_to_regressor)
                         step_regression_outputs[f"layer_{i}"] = reg_out
                         
@@ -160,40 +165,105 @@ class ModelWithRegressorForLM(nn.Module):
                                   beam_width=1, top_k=0, top_p=0.0):
         """
         Generates an output given a prompt and computes regression loss.
-        The target for every regression head at every generation step is the final total sequence length.
+        The target for every regression head at every generation step is the remaining number of tokens
+        to be generated (not the total sequence length).
         Only the regression heads are updated while the LM remains frozen.
+        If a regression head is frozen (requires_grad=False), it will be excluded from loss calculation.
         """
         generated_ids, regression_outputs = self.generate_with_regression(
             input_ids, attention_mask, max_new_tokens, beam_width, top_k, top_p
         )
         final_length = generated_ids.size(1)
-        target = torch.tensor(final_length, dtype=torch.float, device=generated_ids.device)
+        initial_length = input_ids.size(1)
         
         # Calculate loss per layer
         layer_losses = {}
+        step_layer_losses = {}  # Store losses by step and layer for detailed analysis
         total_loss = 0.0
         count = 0
         
+        # Track gradients for analysis
+        gradient_data = {f"layer_{i}": [] for i in range(self.num_layers)}
+        
         for step_idx, step_preds in enumerate(regression_outputs):
-            step_token_idx = input_ids.size(1) + step_idx
+            # Current position in the sequence
+            current_position = initial_length + step_idx
+            # Remaining tokens to be generated
+            remaining_tokens = final_length - current_position
+            target = torch.tensor(remaining_tokens, dtype=torch.float, device=generated_ids.device)
+            
+            # Track step-specific losses
+            if step_idx not in step_layer_losses:
+                step_layer_losses[step_idx] = {}
+            
             for layer, pred in step_preds.items():
+                layer_idx = int(layer.split('_')[1])
+                
+                # Skip loss calculation for frozen layers
+                if not any(p.requires_grad for p in self.regression_heads[layer_idx].parameters()):
+                    layer_losses[layer] = 0.0  # Still record it but as zero
+                    step_layer_losses[step_idx][layer] = 0.0
+                    continue
+                    
+                # Calculate loss for this step and layer
                 mse = F.mse_loss(pred.squeeze(-1), target.expand_as(pred.squeeze(-1)))
+                
+                # Store the individual losses before accumulating for backward
+                step_layer_losses[step_idx][layer] = mse.item()
+                
+                # Track the gradient for this layer at this step
+                if pred.requires_grad:
+                    # Create a separate backward pass for gradient analysis
+                    mse.backward(retain_graph=True)
+                    
+                    # Record gradient norm for each parameter in this head
+                    param_grads = []
+                    for param in self.regression_heads[layer_idx].parameters():
+                        if param.grad is not None:
+                            param_grads.append(param.grad.norm().item())
+                    
+                    gradient_data[layer].append({
+                        'step': step_idx,
+                        'position': current_position,
+                        'target': remaining_tokens,
+                        'prediction': pred.item(),
+                        'loss': mse.item(),
+                        'gradient_norm': sum(param_grads) / len(param_grads) if param_grads else 0
+                    })
+                    
+                    # Zero out gradients after recording
+                    for param in self.regression_heads[layer_idx].parameters():
+                        if param.grad is not None:
+                            param.grad.zero_()
+                
+                # Accumulate loss for the actual optimization step
                 total_loss += mse
                 count += 1
                 
                 # Track loss per layer
                 if layer not in layer_losses:
                     layer_losses[layer] = []
-                layer_losses[layer].append(mse.item())
+                if isinstance(layer_losses[layer], list):
+                    layer_losses[layer].append(mse.item())
+                else:
+                    # Convert from direct value to list if needed
+                    layer_losses[layer] = [mse.item()]
         
         # Average the losses
         avg_loss = total_loss / count if count > 0 else 0.0
         
         # Calculate average loss per layer
-        avg_layer_losses = {layer: sum(losses)/len(losses) for layer, losses in layer_losses.items()}
+        avg_layer_losses = {}
+        for layer, losses in layer_losses.items():
+            if isinstance(losses, list) and losses:
+                avg_layer_losses[layer] = sum(losses) / len(losses)
+            else:
+                avg_layer_losses[layer] = losses  # Already a direct value (0.0)
         
-        optimizer.zero_grad()
-        avg_loss.backward()
-        optimizer.step()
+        # Only perform backward if there are active layers
+        if count > 0:
+            optimizer.zero_grad()
+            avg_loss.backward()
+            optimizer.step()
         
-        return generated_ids, regression_outputs, avg_loss, avg_layer_losses
+        return generated_ids, regression_outputs, avg_loss, avg_layer_losses, step_layer_losses, gradient_data

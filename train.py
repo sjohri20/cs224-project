@@ -7,10 +7,151 @@ import pandas as pd
 from transformers import AutoTokenizer
 import wandb
 import os
+import numpy as np
 from datetime import datetime
 from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmRestarts
 from src.models import ModelWithRegressorForLM
 from src.utils import run_validation_with_save, save_generation_to_file
+
+def log_step_losses_to_wandb(regression_outputs, initial_length, final_length, global_step, epoch):
+    """
+    Logs detailed per-step and per-layer loss information to wandb.
+    Args:
+        regression_outputs: List of dictionaries with regression outputs for each step
+        initial_length: Starting token count (prompt length)
+        final_length: Final token count after generation
+        global_step: Current global training step
+        epoch: Current epoch
+    """
+    num_layers = len([k for k in regression_outputs[0].keys() if k.startswith("layer_")])
+    num_steps = len(regression_outputs)
+    
+    # Create arrays to store step-wise MSE values for each layer
+    step_positions = []  # Token positions in the sequence
+    step_targets = []    # Target values (remaining tokens) at each step
+    layer_step_preds = {f"layer_{i}": [] for i in range(num_layers)}  # Predictions by layer at each step
+    layer_step_errors = {f"layer_{i}": [] for i in range(num_layers)}  # Absolute errors by layer at each step
+    
+    for step_idx, step_preds in enumerate(regression_outputs):
+        # Current position in the sequence
+        current_position = initial_length + step_idx
+        # Remaining tokens to be generated (target value)
+        remaining_tokens = final_length - current_position
+        
+        step_positions.append(current_position)
+        step_targets.append(remaining_tokens)
+        
+        for layer, pred in step_preds.items():
+            # Record prediction
+            pred_value = pred.item() if isinstance(pred.item(), (int, float)) else pred.item()[0]
+            layer_step_preds[layer].append(pred_value)
+            
+            # Calculate and record absolute error
+            abs_error = abs(pred_value - remaining_tokens)
+            layer_step_errors[layer].append(abs_error)
+    
+    # Calculate average error by layer
+    layer_avg_errors = {layer: sum(errors)/len(errors) if errors else 0 
+                       for layer, errors in layer_step_errors.items()}
+    
+    # Calculate average error by step position 
+    # (average across all layers for each step)
+    step_avg_errors = []
+    for step_idx in range(num_steps):
+        step_error = 0
+        count = 0
+        for layer in layer_step_errors:
+            if step_idx < len(layer_step_errors[layer]):
+                step_error += layer_step_errors[layer][step_idx]
+                count += 1
+        step_avg_errors.append(step_error / count if count > 0 else 0)
+    
+    # Log summary metrics
+    wandb.log({
+        "avg_error_by_layer": wandb.Table(
+            columns=["Layer", "Average Absolute Error"],
+            data=[[layer, error] for layer, error in layer_avg_errors.items()]
+        ),
+        "avg_error_by_position": wandb.Table(
+            columns=["Position", "Target", "Average Absolute Error"],
+            data=[[pos, target, error] for pos, target, error in zip(step_positions, step_targets, step_avg_errors)]
+        ),
+        "step": global_step,
+        "epoch": epoch,
+    })
+    
+    # Log detailed plots
+    
+    # 1. Prediction accuracy by layer across generation steps
+    for layer in layer_step_errors:
+        wandb.log({
+            f"{layer}_errors_by_step": wandb.plot.line_series(
+                xs=step_positions,
+                ys=[layer_step_errors[layer]],
+                keys=[layer],
+                title=f"{layer} Error by Generation Step",
+                xname="Token Position"
+            ),
+            "step": global_step,
+            "epoch": epoch,
+        })
+    
+    # 2. Actual vs Predicted remaining tokens at each step for each layer
+    for layer in layer_step_preds:
+        wandb.log({
+            f"{layer}_pred_vs_actual": wandb.plot.line_series(
+                xs=step_positions,
+                ys=[step_targets, layer_step_preds[layer]],
+                keys=["Actual Remaining", f"{layer} Prediction"],
+                title=f"{layer} Prediction vs Actual Remaining Tokens",
+                xname="Token Position"
+            ),
+            "step": global_step,
+            "epoch": epoch,
+        })
+    
+    # 3. Heatmap of all layers' errors across all steps
+    error_matrix = np.zeros((num_layers, num_steps))
+    for i in range(num_layers):
+        layer = f"layer_{i}"
+        for j in range(min(num_steps, len(layer_step_errors[layer]))):
+            error_matrix[i, j] = layer_step_errors[layer][j]
+    
+    wandb.log({
+        "layer_step_error_heatmap": wandb.plots.HeatMap(
+            x_labels=[f"Pos {p}" for p in step_positions],
+            y_labels=[f"Layer {i}" for i in range(num_layers)],
+            matrix_values=error_matrix.tolist(),
+            show_text=False
+        ),
+        "step": global_step,
+        "epoch": epoch,
+    })
+    
+    # 4. Compare all layers' predictions at each step
+    for step_idx, pos in enumerate(step_positions):
+        if step_idx < num_steps:
+            step_preds_by_layer = []
+            for i in range(num_layers):
+                layer = f"layer_{i}"
+                if step_idx < len(layer_step_preds[layer]):
+                    step_preds_by_layer.append(layer_step_preds[layer][step_idx])
+                else:
+                    step_preds_by_layer.append(0)
+            
+            wandb.log({
+                f"step_{step_idx}_position_{pos}_layer_predictions": wandb.plot.bar(
+                    table=wandb.Table(
+                        columns=["Layer", "Prediction"],
+                        data=[[f"Layer {i}", step_preds_by_layer[i]] for i in range(num_layers)]
+                    ),
+                    value="Prediction",
+                    label="Layer",
+                    title=f"Layer Predictions at Position {pos} (Target: {step_targets[step_idx]})"
+                ),
+                "step": global_step,
+                "epoch": epoch,
+            })
 
 def main():
     parser = argparse.ArgumentParser(description="Train regression heads to predict output token count.")
@@ -89,6 +230,8 @@ def main():
     best_layer_val_losses = {f"layer_{i}": float('inf') for i in range(model.num_layers)}
     # Track early stopping counters per layer
     layer_early_stopping_counters = {f"layer_{i}": 0 for i in range(model.num_layers)}
+    # Track which layers are frozen
+    frozen_layers = {f"layer_{i}": False for i in range(model.num_layers)}
     
     # Create directory for layer-specific models
     os.makedirs("layer_models", exist_ok=True)
@@ -96,7 +239,8 @@ def main():
     # Initialize tracking metrics table
     headers = ["Epoch", "Step", "LR"] + \
               [f"Train_L{i}" for i in range(model.num_layers)] + \
-              [f"Val_L{i}" for i in range(model.num_layers)]
+              [f"Val_L{i}" for i in range(model.num_layers)] + \
+              [f"Frozen_L{i}" for i in range(model.num_layers)]
     print(" | ".join(headers))
     
     global_step = 0
@@ -109,14 +253,30 @@ def main():
         train_layer_losses = {f"layer_{i}": 0.0 for i in range(model.num_layers)}
         samples_since_validation = 0
         
+        # Check if all layers are frozen
+        if all(frozen_layers.values()):
+            print("All regression heads are frozen. Stopping training.")
+            break
+            
         for idx, row in train_prompts.iterrows():
             global_step += 1
             prompt = row['prompt']  # Assuming 'prompt' is the column name
             print(f"Processing training prompt {idx+1}/{len(train_prompts)}: {prompt[:50]}...")
             
-            inputs = tokenizer(prompt, return_tensors="pt").to(device)
+            # Before training, freeze gradient flow for frozen layers
+            for layer_idx in range(model.num_layers):
+                layer_name = f"layer_{layer_idx}"
+                if frozen_layers[layer_name]:
+                    for param in model.regression_heads[layer_idx].parameters():
+                        param.requires_grad = False
+                else:
+                    for param in model.regression_heads[layer_idx].parameters():
+                        param.requires_grad = True
             
-            generated_ids, regression_outputs, loss, layer_losses = model.train_regressor_on_prompt(
+            inputs = tokenizer(prompt, return_tensors="pt").to(device)
+            initial_length = inputs["input_ids"].size(1)
+            
+            generated_ids, regression_outputs, loss, layer_losses, step_layer_losses, gradient_data = model.train_regressor_on_prompt(
                 inputs["input_ids"],
                 inputs["attention_mask"],
                 max_new_tokens,
@@ -130,6 +290,74 @@ def main():
             final_length = generated_ids.size(1)
             total_train_loss += loss.item()
             
+            # Log detailed per-step and per-layer metrics
+            log_step_losses_to_wandb(
+                regression_outputs, 
+                initial_length, 
+                final_length,
+                global_step,
+                epoch + 1
+            )
+            
+            # Log gradient information
+            for layer, layer_grads in gradient_data.items():
+                if layer_grads:  # Only log if we have gradient data for this layer
+                    # Create data for position vs gradient norm plot
+                    positions = [item['position'] for item in layer_grads]
+                    grad_norms = [item['gradient_norm'] for item in layer_grads]
+                    losses = [item['loss'] for item in layer_grads]
+                    targets = [item['target'] for item in layer_grads]
+                    predictions = [item['prediction'] for item in layer_grads]
+                    
+                    # Log gradient norm over position
+                    wandb.log({
+                        f"{layer}_gradient_norms": wandb.plot.line_series(
+                            xs=positions,
+                            ys=[grad_norms],
+                            keys=[f"{layer} Gradient Norm"],
+                            title=f"{layer} Gradient Norm by Position",
+                            xname="Token Position"
+                        ),
+                        f"{layer}_loss_vs_gradient": wandb.plot.scatter(
+                            x=losses,
+                            y=grad_norms,
+                            title=f"{layer} Loss vs Gradient Norm"
+                        ),
+                        f"{layer}_target_pred_comparison": wandb.plot.line_series(
+                            xs=positions,
+                            ys=[targets, predictions],
+                            keys=["Actual Remaining", "Predicted Remaining"],
+                            title=f"{layer} Target vs Prediction",
+                            xname="Token Position"
+                        ),
+                        "step": global_step,
+                        "epoch": epoch + 1
+                    })
+            
+            # Visualize loss distribution across steps and layers
+            if step_layer_losses:
+                step_positions = [initial_length + step_idx for step_idx in step_layer_losses.keys()]
+                layer_indices = range(model.num_layers)
+                
+                # Create a heatmap for loss across steps and layers
+                loss_matrix = np.zeros((len(layer_indices), len(step_positions)))
+                for i, step_idx in enumerate(step_layer_losses.keys()):
+                    for j, layer_idx in enumerate(layer_indices):
+                        layer_key = f"layer_{layer_idx}"
+                        if layer_key in step_layer_losses[step_idx]:
+                            loss_matrix[j, i] = step_layer_losses[step_idx][layer_key]
+                
+                wandb.log({
+                    "step_layer_loss_heatmap": wandb.plots.HeatMap(
+                        x_labels=[f"Pos {pos}" for pos in step_positions],
+                        y_labels=[f"Layer {i}" for i in layer_indices],
+                        matrix_values=loss_matrix.tolist(),
+                        show_text=False
+                    ),
+                    "step": global_step,
+                    "epoch": epoch + 1
+                })
+            
             # Save generated text to file
             generation_data = {
                 "epoch": epoch + 1,
@@ -139,13 +367,15 @@ def main():
                 "token_count": final_length,
                 "loss": loss.item(),
                 "layer_losses": {k: v for k, v in layer_losses.items()},
+                "frozen_layers": {k: v for k, v in frozen_layers.items()},
                 "timestamp": datetime.now().isoformat()
             }
             save_generation_to_file(train_outputs_file, generation_data)
             
-            # Accumulate layer losses
+            # Accumulate layer losses only for non-frozen layers
             for layer, val in layer_losses.items():
-                train_layer_losses[layer] += val
+                if not frozen_layers[layer]:
+                    train_layer_losses[layer] += val
             
             # Get current learning rate
             current_lr = optimizer.param_groups[0]['lr']
@@ -161,6 +391,7 @@ def main():
             
             # Format layer losses for logging
             log_layer_losses = {f"train_loss_{layer}": val for layer, val in layer_losses.items()}
+            log_frozen_status = {f"frozen_{layer}": status for layer, status in frozen_layers.items()}
             
             # Log learning rate
             wandb.log({
@@ -169,8 +400,10 @@ def main():
                 "actual_length": final_length,
                 **last_step_preds,
                 **log_layer_losses,
+                **log_frozen_status,
                 "epoch": epoch + 1,
                 "step": global_step,
+                "active_heads": sum(1 for status in frozen_layers.values() if not status)
             })
             
             samples_since_validation += 1
@@ -181,9 +414,28 @@ def main():
                 samples_since_validation = 0
                 
                 # Current training stats
-                curr_avg_train_loss = total_train_loss / (idx + 1)
-                curr_avg_train_layer_losses = {layer: loss / (idx + 1) 
-                                              for layer, loss in train_layer_losses.items()}
+                active_training_layers = [layer for layer, frozen in frozen_layers.items() if not frozen]
+                
+                if not active_training_layers:
+                    print("All regression heads are frozen. Stopping training.")
+                    break
+                    
+                # Calculate average training loss for active layers
+                curr_avg_train_loss = 0.0
+                count_active = 0
+                curr_avg_train_layer_losses = {}
+                
+                for layer, loss_sum in train_layer_losses.items():
+                    if not frozen_layers[layer]:
+                        # Only count samples where the layer was active
+                        samples_active = idx + 1
+                        avg_loss = loss_sum / samples_active
+                        curr_avg_train_layer_losses[layer] = avg_loss
+                        curr_avg_train_loss += avg_loss
+                        count_active += 1
+                
+                if count_active > 0:
+                    curr_avg_train_loss /= count_active
                 
                 # Run validation
                 avg_val_loss, avg_val_layer_losses, val_generations = run_validation_with_save(
@@ -196,10 +448,16 @@ def main():
                 metrics_row = [f"{epoch+1}", f"{global_step}", f"{current_lr:.6f}"]
                 for i in range(model.num_layers):
                     layer_key = f"layer_{i}"
-                    metrics_row.append(f"{curr_avg_train_layer_losses.get(layer_key, 0):.4f}")
+                    if frozen_layers[layer_key]:
+                        metrics_row.append("frozen")
+                    else:
+                        metrics_row.append(f"{curr_avg_train_layer_losses.get(layer_key, 0):.4f}")
                 for i in range(model.num_layers):
                     layer_key = f"layer_{i}"
                     metrics_row.append(f"{avg_val_layer_losses.get(layer_key, 0):.4f}")
+                for i in range(model.num_layers):
+                    layer_key = f"layer_{i}"
+                    metrics_row.append(f"{'Yes' if frozen_layers[layer_key] else 'No'}")
                 print(" | ".join(metrics_row))
                 
                 # Log mid-epoch stats
@@ -208,8 +466,10 @@ def main():
                     "epoch_avg_val_loss": avg_val_loss,
                     **{f"epoch_avg_train_{layer}": loss for layer, loss in curr_avg_train_layer_losses.items()},
                     **{f"epoch_avg_val_{layer}": loss for layer, loss in avg_val_layer_losses.items()},
+                    **log_frozen_status,
                     "epoch": epoch + 1,
                     "step": global_step,
+                    "active_heads": sum(1 for status in frozen_layers.values() if not status)
                 })
                 
                 # Check for overall model improvement
@@ -224,13 +484,18 @@ def main():
                         'epoch': epoch,
                         'step': global_step,
                         'loss': best_overall_val_loss,
+                        'frozen_layers': frozen_layers,
                     }, save_path)
                 
-                # Check for per-layer model improvement
+                # Check for per-layer model improvement or early stopping
                 improved_layers = []
                 layers_not_improved = []
                 
                 for layer, val_loss in avg_val_layer_losses.items():
+                    # Skip already frozen layers
+                    if frozen_layers[layer]:
+                        continue
+                        
                     if val_loss < best_layer_val_losses[layer]:
                         best_layer_val_losses[layer] = val_loss
                         improved_layers.append(layer)
@@ -254,18 +519,20 @@ def main():
                         # Increment early stopping counter for this layer
                         layer_early_stopping_counters[layer] += 1
                         layers_not_improved.append(f"{layer} ({layer_early_stopping_counters[layer]}/{early_stopping})")
+                        
+                        # Check if this layer should be frozen
+                        if layer_early_stopping_counters[layer] >= early_stopping:
+                            frozen_layers[layer] = True
+                            print(f"Early stopping triggered for {layer}. Freezing this regression head.")
                 
                 if improved_layers:
                     print(f"Improved layers in this step: {', '.join(improved_layers)}")
                 if layers_not_improved:
                     print(f"Layers without improvement: {', '.join(layers_not_improved)}")
                 
-                # Check if any layer has exceeded early stopping threshold
-                layers_to_stop = [layer for layer, counter in layer_early_stopping_counters.items() 
-                                 if counter >= early_stopping]
-                if layers_to_stop:
-                    print(f"Early stopping triggered for layers: {', '.join(layers_to_stop)}")
-                    print(f"Training stopped after {idx+1} samples in epoch {epoch+1}")
+                # Check if all layers are frozen
+                if all(frozen_layers.values()):
+                    print(f"All regression heads are frozen. Training stopped after {idx+1} samples in epoch {epoch+1}")
                     break
                 
                 # Resume training
@@ -275,19 +542,36 @@ def main():
             if scheduler and scheduler_type == "cosine_warm_restarts":
                 scheduler.step(epoch + idx / len(train_prompts))
         
-        # Check if any layer has exceeded early stopping threshold
-        layers_to_stop = [layer for layer, counter in layer_early_stopping_counters.items() 
-                         if counter >= early_stopping]
-        if layers_to_stop:
-            print(f"Early stopping triggered for layers: {', '.join(layers_to_stop)}")
+        # Check if all layers are frozen
+        if all(frozen_layers.values()):
+            print(f"All regression heads are frozen. Training stopped after epoch {epoch+1}")
             break
             
         # Run validation at the end of each epoch regardless of val_freq
         if val_freq == 0 or samples_since_validation > 0:
             # Calculate average training losses for the full epoch
-            avg_train_loss = total_train_loss / len(train_prompts)
-            avg_train_layer_losses = {layer: loss / len(train_prompts) 
-                                     for layer, loss in train_layer_losses.items()}
+            active_training_layers = [layer for layer, frozen in frozen_layers.items() if not frozen]
+            
+            if not active_training_layers:
+                print("All regression heads are frozen. Stopping training.")
+                break
+                
+            # Calculate average training loss for active layers
+            avg_train_loss = 0.0
+            count_active = 0
+            avg_train_layer_losses = {}
+            
+            for layer, loss_sum in train_layer_losses.items():
+                if not frozen_layers[layer]:
+                    # Get count of samples where this layer was active
+                    samples_active = len(train_prompts)
+                    avg_loss = loss_sum / samples_active
+                    avg_train_layer_losses[layer] = avg_loss
+                    avg_train_loss += avg_loss
+                    count_active += 1
+            
+            if count_active > 0:
+                avg_train_loss /= count_active
             
             print(f"Epoch {epoch+1} average training loss: {avg_train_loss:.4f}")
             
@@ -305,22 +589,31 @@ def main():
             metrics_row = [f"{epoch+1}", f"{global_step}", f"{current_lr:.6f}"]
             for i in range(model.num_layers):
                 layer_key = f"layer_{i}"
-                metrics_row.append(f"{avg_train_layer_losses.get(layer_key, 0):.4f}")
+                if frozen_layers[layer_key]:
+                    metrics_row.append("frozen")
+                else:
+                    metrics_row.append(f"{avg_train_layer_losses.get(layer_key, 0):.4f}")
             for i in range(model.num_layers):
                 layer_key = f"layer_{i}"
                 metrics_row.append(f"{avg_val_layer_losses.get(layer_key, 0):.4f}")
+            for i in range(model.num_layers):
+                layer_key = f"layer_{i}"
+                metrics_row.append(f"{'Yes' if frozen_layers[layer_key] else 'No'}")
             print(" | ".join(metrics_row))
             
             # Log epoch averages
+            log_frozen_status = {f"frozen_{layer}": status for layer, status in frozen_layers.items()}
             wandb.log({
                 "epoch_avg_train_loss": avg_train_loss,
                 "epoch_avg_val_loss": avg_val_loss,
                 "learning_rate": current_lr,
                 **{f"epoch_avg_train_{layer}": loss for layer, loss in avg_train_layer_losses.items()},
                 **{f"epoch_avg_val_{layer}": loss for layer, loss in avg_val_layer_losses.items()},
+                **log_frozen_status,
                 "epoch": epoch + 1,
                 "step": global_step,
                 "completed_epoch": True,
+                "active_heads": sum(1 for status in frozen_layers.values() if not status)
             })
             
             # Check for overall model improvement
@@ -335,6 +628,7 @@ def main():
                     'epoch': epoch,
                     'step': global_step,
                     'loss': best_overall_val_loss,
+                    'frozen_layers': frozen_layers,
                 }, save_path)
             
             # Check for per-layer model improvement
@@ -342,6 +636,10 @@ def main():
             layers_not_improved = []
             
             for layer, val_loss in avg_val_layer_losses.items():
+                # Skip already frozen layers
+                if frozen_layers[layer]:
+                    continue
+                    
                 if val_loss < best_layer_val_losses[layer]:
                     best_layer_val_losses[layer] = val_loss
                     improved_layers.append(layer)
@@ -365,18 +663,20 @@ def main():
                     # Increment early stopping counter for this layer
                     layer_early_stopping_counters[layer] += 1
                     layers_not_improved.append(f"{layer} ({layer_early_stopping_counters[layer]}/{early_stopping})")
+                    
+                    # Check if this layer should be frozen
+                    if layer_early_stopping_counters[layer] >= early_stopping:
+                        frozen_layers[layer] = True
+                        print(f"Early stopping triggered for {layer}. Freezing this regression head.")
             
             if improved_layers:
                 print(f"Improved layers in this epoch: {', '.join(improved_layers)}")
             if layers_not_improved:
                 print(f"Layers without improvement: {', '.join(layers_not_improved)}")
             
-            # Check if any layer has exceeded early stopping threshold
-            layers_to_stop = [layer for layer, counter in layer_early_stopping_counters.items() 
-                             if counter >= early_stopping]
-            if layers_to_stop:
-                print(f"Early stopping triggered for layers: {', '.join(layers_to_stop)}")
-                print(f"Training stopped after {epoch+1} epochs")
+            # Check if all layers are frozen
+            if all(frozen_layers.values()):
+                print(f"All regression heads are frozen. Training stopped after epoch {epoch+1}")
                 break
         
         # Step the scheduler based on epoch
@@ -387,6 +687,9 @@ def main():
     print("Best validation losses per layer:")
     for layer, loss in best_layer_val_losses.items():
         print(f"  {layer}: {loss:.4f}")
+    print("Final frozen status per layer:")
+    for layer, status in frozen_layers.items():
+        print(f"  {layer}: {'Frozen' if status else 'Active'}")
 
 if __name__ == "__main__":
     main()
