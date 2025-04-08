@@ -1,13 +1,13 @@
 model_name: "meta-llama/Meta-Llama-3-8B-Instruct"
-prompt_train: "prompts_train.csv"
-prompt_val: "prompts_val.csv"
-prompt_test: "prompts_test.csv"
+prompt_train: "data/alpaca_train.csv"
+prompt_val: "data/alpaca_val.csv"
+prompt_test: "data/alpaca_test.csv"
 max_new_tokens: 10
 beam_width: 1
 top_k: 50
 top_p: 0.9
 include_token_count: true
-lr: 0.0001
+lr: 0.000001
 early_stopping: 10
 val_freq: 1000
 epochs: 10
