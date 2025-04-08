@@ -60,6 +60,7 @@ def save_validation_data_to_csv(regression_outputs, initial_length, final_length
 def log_validation_simplified_metrics(regression_outputs, initial_length, final_length, global_step, epoch, prompt_idx):
     """
     Log only beginning and midpoint validation metrics to wandb.
+    Instead of logging with prompt index, we'll accumulate metrics in wandb.
     """
     if not regression_outputs:
         return
@@ -94,10 +95,11 @@ def log_validation_simplified_metrics(regression_outputs, initial_length, final_
                 pred_value = pred.item() if isinstance(pred.item(), (int, float)) else pred.item()[0]
                 error = abs(pred_value - remaining_tokens)
                 
-                layer_metrics[f"val_{prompt_idx}_{layer}_{point_name}_prediction"] = pred_value
-                layer_metrics[f"val_{prompt_idx}_{layer}_{point_name}_error"] = error
-                layer_metrics[f"val_{prompt_idx}_{point_name}_position"] = current_position
-                layer_metrics[f"val_{prompt_idx}_{point_name}_remaining"] = remaining_tokens
+                # Remove prompt_idx from metric names to aggregate properly
+                layer_metrics[f"{layer}_{point_name}_prediction"] = pred_value
+                layer_metrics[f"{layer}_{point_name}_error"] = error
+                layer_metrics[f"{point_name}_position"] = current_position
+                layer_metrics[f"{point_name}_remaining_tokens"] = remaining_tokens
             
             # Log to wandb
             wandb.log({

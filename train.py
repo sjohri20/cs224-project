@@ -74,6 +74,7 @@ def save_step_data_to_csv(regression_outputs, initial_length, final_length, glob
 def log_simplified_metrics_to_wandb(regression_outputs, initial_length, final_length, global_step, epoch):
     """
     Log only beginning and midpoint metrics to wandb.
+    Metrics are logged without prompt indices to facilitate aggregation.
     Args:
         regression_outputs: List of dictionaries with regression outputs for each step
         initial_length: Starting token count (prompt length)
@@ -116,7 +117,7 @@ def log_simplified_metrics_to_wandb(regression_outputs, initial_length, final_le
                 
                 layer_metrics[f"{layer}_{point_name}_prediction"] = pred_value
                 layer_metrics[f"{layer}_{point_name}_error"] = error
-                layer_metrics[f"{point_name}_token_position"] = current_position
+                layer_metrics[f"{point_name}_position"] = current_position
                 layer_metrics[f"{point_name}_remaining_tokens"] = remaining_tokens
             
             # Log to wandb
