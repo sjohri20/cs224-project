@@ -42,7 +42,7 @@ def log_validation_step_metrics(regression_outputs, initial_length, final_length
     layer_avg_errors = {layer: sum(errors)/len(errors) if errors else 0 
                        for layer, errors in layer_step_errors.items()}
     
-    # Log validation heatmap
+    # Log validation data as table instead of heatmap
     error_matrix = np.zeros((num_layers, num_steps))
     for i in range(num_layers):
         layer = f"layer_{i}"
@@ -58,15 +58,9 @@ def log_validation_step_metrics(regression_outputs, initial_length, final_length
                 heatmap_data.append([f"Layer {i}", f"Pos {step_positions[j]}", 0])
     
     wandb.log({
-        f"val_prompt_{prompt_idx}_error_heatmap": wandb.plot.heatmap(
-            x="Position",
-            y="Layer",
-            z="Error",
-            data=wandb.Table(
-                columns=["Layer", "Position", "Error"],
-                data=heatmap_data
-            ),
-            title=f"Validation Prompt {prompt_idx} - Error by Layer and Position"
+        f"val_prompt_{prompt_idx}_error_table": wandb.Table(
+            columns=["Layer", "Position", "Error"],
+            data=heatmap_data
         ),
         "step": global_step,
         "epoch": epoch,
@@ -337,15 +331,6 @@ def run_validation_with_save(model, tokenizer, val_prompts, device, max_new_toke
             columns=["Position", "Average Error"],
             data=position_data
         ),
-        "val_position_error_chart": wandb.plot.line(
-            table=wandb.Table(
-                columns=["Position", "Error"],
-                data=position_data
-            ),
-            x="Position",
-            y="Error",
-            title="Validation Error by Token Position"
-        ),
         "step": global_step,
         "epoch": epoch + 1,
     })
@@ -359,15 +344,6 @@ def run_validation_with_save(model, tokenizer, val_prompts, device, max_new_toke
         "val_error_by_layer": wandb.Table(
             columns=["Layer", "Average Error"],
             data=layer_data
-        ),
-        "val_layer_error_chart": wandb.plot.bar(
-            table=wandb.Table(
-                columns=["Layer", "Error"],
-                data=layer_data
-            ),
-            x="Layer",
-            y="Error",
-            title="Average Validation Error by Layer"
         ),
         "step": global_step,
         "epoch": epoch + 1,

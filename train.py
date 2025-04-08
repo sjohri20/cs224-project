@@ -84,13 +84,11 @@ def log_step_losses_to_wandb(regression_outputs, initial_length, final_length, g
     
     # 1. Prediction accuracy by layer across generation steps
     for layer in layer_step_errors:
+        error_data = [[pos, error] for pos, error in zip(step_positions, layer_step_errors[layer])]
         wandb.log({
-            f"{layer}_errors_by_step": wandb.plot.line_series(
-                xs=step_positions,
-                ys=[layer_step_errors[layer]],
-                keys=[layer],
-                title=f"{layer} Error by Generation Step",
-                xname="Token Position"
+            f"{layer}_errors_by_step": wandb.Table(
+                columns=["Position", "Error"],
+                data=error_data
             ),
             "step": global_step,
             "epoch": epoch,
@@ -98,25 +96,18 @@ def log_step_losses_to_wandb(regression_outputs, initial_length, final_length, g
     
     # 2. Actual vs Predicted remaining tokens at each step for each layer
     for layer in layer_step_preds:
+        pred_vs_actual = [[pos, target, pred] for pos, target, pred in 
+                          zip(step_positions, step_targets, layer_step_preds[layer])]
         wandb.log({
-            f"{layer}_pred_vs_actual": wandb.plot.line_series(
-                xs=step_positions,
-                ys=[step_targets, layer_step_preds[layer]],
-                keys=["Actual Remaining", f"{layer} Prediction"],
-                title=f"{layer} Prediction vs Actual Remaining Tokens",
-                xname="Token Position"
+            f"{layer}_pred_vs_actual": wandb.Table(
+                columns=["Position", "Actual Remaining", f"{layer} Prediction"],
+                data=pred_vs_actual
             ),
             "step": global_step,
             "epoch": epoch,
         })
     
-    # 3. Heatmap of all layers' errors across all steps
-    error_matrix = np.zeros((num_layers, num_steps))
-    for i in range(num_layers):
-        layer = f"layer_{i}"
-        for j in range(min(num_steps, len(layer_step_errors[layer]))):
-            error_matrix[i, j] = layer_step_errors[layer][j]
-    
+    # 3. Heatmap of all layers' errors across all steps - using Table instead of heatmap
     heatmap_data = []
     for i in range(num_layers):
         for j in range(num_steps):
@@ -126,15 +117,9 @@ def log_step_losses_to_wandb(regression_outputs, initial_length, final_length, g
                 heatmap_data.append([f"Layer {i}", f"Pos {step_positions[j]}", 0])
     
     wandb.log({
-        "layer_step_error_heatmap": wandb.plot.heatmap(
-            x="Position",
-            y="Layer",
-            z="Error",
-            data=wandb.Table(
-                columns=["Layer", "Position", "Error"],
-                data=heatmap_data
-            ),
-            title="Error by Layer and Position"
+        "layer_step_error_table": wandb.Table(
+            columns=["Layer", "Position", "Error"],
+            data=heatmap_data
         ),
         "step": global_step,
         "epoch": epoch,
@@ -147,19 +132,14 @@ def log_step_losses_to_wandb(regression_outputs, initial_length, final_length, g
             for i in range(num_layers):
                 layer = f"layer_{i}"
                 if step_idx < len(layer_step_preds[layer]):
-                    step_preds_by_layer.append(layer_step_preds[layer][step_idx])
+                    step_preds_by_layer.append([f"Layer {i}", layer_step_preds[layer][step_idx]])
                 else:
-                    step_preds_by_layer.append(0)
+                    step_preds_by_layer.append([f"Layer {i}", 0])
             
             wandb.log({
-                f"step_{step_idx}_position_{pos}_layer_predictions": wandb.plot.bar(
-                    table=wandb.Table(
-                        columns=["Layer", "Prediction"],
-                        data=[[f"Layer {i}", step_preds_by_layer[i]] for i in range(num_layers)]
-                    ),
-                    value="Prediction",
-                    label="Layer",
-                    title=f"Layer Predictions at Position {pos} (Target: {step_targets[step_idx]})"
+                f"step_{step_idx}_position_{pos}_layer_predictions": wandb.Table(
+                    columns=["Layer", "Prediction"],
+                    data=step_preds_by_layer
                 ),
                 "step": global_step,
                 "epoch": epoch,
@@ -314,44 +294,33 @@ def main():
             # Log gradient information
             for layer, layer_grads in gradient_data.items():
                 if layer_grads:  # Only log if we have gradient data for this layer
-                    # Create data for position vs gradient norm plot
-                    positions = [item['position'] for item in layer_grads]
-                    grad_norms = [item['gradient_norm'] for item in layer_grads]
-                    losses = [item['loss'] for item in layer_grads]
-                    targets = [item['target'] for item in layer_grads]
-                    predictions = [item['prediction'] for item in layer_grads]
+                    # Convert to table format
+                    grad_data = []
+                    for item in layer_grads:
+                        grad_data.append([
+                            item['position'], 
+                            item['target'], 
+                            item['prediction'],
+                            item['loss'],
+                            item['gradient_norm']
+                        ])
                     
-                    # Log gradient norm over position
+                    # Log as table
                     wandb.log({
-                        f"{layer}_gradient_norms": wandb.plot.line_series(
-                            xs=positions,
-                            ys=[grad_norms],
-                            keys=[f"{layer} Gradient Norm"],
-                            title=f"{layer} Gradient Norm by Position",
-                            xname="Token Position"
-                        ),
-                        f"{layer}_loss_vs_gradient": wandb.plot.scatter(
-                            x=losses,
-                            y=grad_norms,
-                            title=f"{layer} Loss vs Gradient Norm"
-                        ),
-                        f"{layer}_target_pred_comparison": wandb.plot.line_series(
-                            xs=positions,
-                            ys=[targets, predictions],
-                            keys=["Actual Remaining", "Predicted Remaining"],
-                            title=f"{layer} Target vs Prediction",
-                            xname="Token Position"
+                        f"{layer}_gradient_data": wandb.Table(
+                            columns=["Position", "Target", "Prediction", "Loss", "Gradient Norm"],
+                            data=grad_data
                         ),
                         "step": global_step,
                         "epoch": epoch + 1
                     })
             
-            # Visualize loss distribution across steps and layers
+            # Visualize loss distribution across steps and layers - using Table instead of heatmap
             if step_layer_losses:
                 step_positions = [initial_length + step_idx for step_idx in step_layer_losses.keys()]
                 layer_indices = range(model.num_layers)
                 
-                # Create data for heatmap
+                # Create data for table
                 heatmap_data = []
                 for step_idx in step_layer_losses.keys():
                     position = initial_length + step_idx
@@ -363,15 +332,9 @@ def main():
                         heatmap_data.append([f"Layer {layer_idx}", f"Pos {position}", loss_value])
                 
                 wandb.log({
-                    "step_layer_loss_heatmap": wandb.plot.heatmap(
-                        x="Position",
-                        y="Layer",
-                        z="Loss",
-                        data=wandb.Table(
-                            columns=["Layer", "Position", "Loss"],
-                            data=heatmap_data
-                        ),
-                        title="Loss by Layer and Position"
+                    "step_layer_loss_table": wandb.Table(
+                        columns=["Layer", "Position", "Loss"],
+                        data=heatmap_data
                     ),
                     "step": global_step,
                     "epoch": epoch + 1
