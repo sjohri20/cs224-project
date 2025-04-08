@@ -49,12 +49,24 @@ def log_validation_step_metrics(regression_outputs, initial_length, final_length
         for j in range(min(num_steps, len(layer_step_errors[layer]))):
             error_matrix[i, j] = layer_step_errors[layer][j]
     
+    heatmap_data = []
+    for i in range(num_layers):
+        for j in range(num_steps):
+            if j < len(layer_step_errors[f"layer_{i}"]):
+                heatmap_data.append([f"Layer {i}", f"Pos {step_positions[j]}", layer_step_errors[f"layer_{i}"][j]])
+            else:
+                heatmap_data.append([f"Layer {i}", f"Pos {step_positions[j]}", 0])
+    
     wandb.log({
-        f"val_prompt_{prompt_idx}_error_heatmap": wandb.plots.HeatMap(
-            x_labels=[f"Pos {p}" for p in step_positions],
-            y_labels=[f"Layer {i}" for i in range(num_layers)],
-            matrix_values=error_matrix.tolist(),
-            show_text=False
+        f"val_prompt_{prompt_idx}_error_heatmap": wandb.plot.heatmap(
+            x="Position",
+            y="Layer",
+            z="Error",
+            data=wandb.Table(
+                columns=["Layer", "Position", "Error"],
+                data=heatmap_data
+            ),
+            title=f"Validation Prompt {prompt_idx} - Error by Layer and Position"
         ),
         "step": global_step,
         "epoch": epoch,

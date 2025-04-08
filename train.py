@@ -117,12 +117,24 @@ def log_step_losses_to_wandb(regression_outputs, initial_length, final_length, g
         for j in range(min(num_steps, len(layer_step_errors[layer]))):
             error_matrix[i, j] = layer_step_errors[layer][j]
     
+    heatmap_data = []
+    for i in range(num_layers):
+        for j in range(num_steps):
+            if j < len(layer_step_errors[f"layer_{i}"]):
+                heatmap_data.append([f"Layer {i}", f"Pos {step_positions[j]}", layer_step_errors[f"layer_{i}"][j]])
+            else:
+                heatmap_data.append([f"Layer {i}", f"Pos {step_positions[j]}", 0])
+    
     wandb.log({
-        "layer_step_error_heatmap": wandb.plots.HeatMap(
-            x_labels=[f"Pos {p}" for p in step_positions],
-            y_labels=[f"Layer {i}" for i in range(num_layers)],
-            matrix_values=error_matrix.tolist(),
-            show_text=False
+        "layer_step_error_heatmap": wandb.plot.heatmap(
+            x="Position",
+            y="Layer",
+            z="Error",
+            data=wandb.Table(
+                columns=["Layer", "Position", "Error"],
+                data=heatmap_data
+            ),
+            title="Error by Layer and Position"
         ),
         "step": global_step,
         "epoch": epoch,
@@ -339,20 +351,27 @@ def main():
                 step_positions = [initial_length + step_idx for step_idx in step_layer_losses.keys()]
                 layer_indices = range(model.num_layers)
                 
-                # Create a heatmap for loss across steps and layers
-                loss_matrix = np.zeros((len(layer_indices), len(step_positions)))
-                for i, step_idx in enumerate(step_layer_losses.keys()):
-                    for j, layer_idx in enumerate(layer_indices):
+                # Create data for heatmap
+                heatmap_data = []
+                for step_idx in step_layer_losses.keys():
+                    position = initial_length + step_idx
+                    for layer_idx in layer_indices:
                         layer_key = f"layer_{layer_idx}"
+                        loss_value = 0.0
                         if layer_key in step_layer_losses[step_idx]:
-                            loss_matrix[j, i] = step_layer_losses[step_idx][layer_key]
+                            loss_value = step_layer_losses[step_idx][layer_key]
+                        heatmap_data.append([f"Layer {layer_idx}", f"Pos {position}", loss_value])
                 
                 wandb.log({
-                    "step_layer_loss_heatmap": wandb.plots.HeatMap(
-                        x_labels=[f"Pos {pos}" for pos in step_positions],
-                        y_labels=[f"Layer {i}" for i in layer_indices],
-                        matrix_values=loss_matrix.tolist(),
-                        show_text=False
+                    "step_layer_loss_heatmap": wandb.plot.heatmap(
+                        x="Position",
+                        y="Layer",
+                        z="Loss",
+                        data=wandb.Table(
+                            columns=["Layer", "Position", "Loss"],
+                            data=heatmap_data
+                        ),
+                        title="Loss by Layer and Position"
                     ),
                     "step": global_step,
                     "epoch": epoch + 1
