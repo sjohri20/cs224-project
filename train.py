@@ -4,8 +4,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import pandas as pd
-from transformers import AutoTokenizer
-import wandb
+import csv
 import os
 import numpy as np
 from datetime import datetime
@@ -13,24 +12,28 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmResta
 from src.models import ModelWithRegressorForLM
 from src.utils import run_validation_with_save, save_generation_to_file
 
-def log_step_losses_to_wandb(regression_outputs, initial_length, final_length, global_step, epoch):
+def save_step_data_to_csv(regression_outputs, initial_length, final_length, global_step, epoch, sample_idx, csv_dir="logs/token_data"):
     """
-    Logs detailed per-step and per-layer loss information to wandb.
+    Save detailed per-step and per-layer metrics to CSV files.
     Args:
         regression_outputs: List of dictionaries with regression outputs for each step
         initial_length: Starting token count (prompt length)
         final_length: Final token count after generation
         global_step: Current global training step
         epoch: Current epoch
+        sample_idx: Index of the current training sample
+        csv_dir: Directory to save CSV files
     """
-    num_layers = len([k for k in regression_outputs[0].keys() if k.startswith("layer_")])
-    num_steps = len(regression_outputs)
+    # Create directory if it doesn't exist
+    os.makedirs(csv_dir, exist_ok=True)
     
-    # Create arrays to store step-wise MSE values for each layer
-    step_positions = []  # Token positions in the sequence
-    step_targets = []    # Target values (remaining tokens) at each step
-    layer_step_preds = {f"layer_{i}": [] for i in range(num_layers)}  # Predictions by layer at each step
-    layer_step_errors = {f"layer_{i}": [] for i in range(num_layers)}  # Absolute errors by layer at each step
+    # Filename format: epoch_step_sample.csv
+    filename = f"{csv_dir}/epoch_{epoch}_step_{global_step}_sample_{sample_idx}.csv"
+    
+    num_layers = len([k for k in regression_outputs[0].keys() if k.startswith("layer_")])
+    
+    # Prepare data for CSV
+    rows = []
     
     for step_idx, step_preds in enumerate(regression_outputs):
         # Current position in the sequence
@@ -38,111 +41,87 @@ def log_step_losses_to_wandb(regression_outputs, initial_length, final_length, g
         # Remaining tokens to be generated (target value)
         remaining_tokens = final_length - current_position
         
-        step_positions.append(current_position)
-        step_targets.append(remaining_tokens)
+        # Basic row information
+        row = {
+            'epoch': epoch,
+            'global_step': global_step,
+            'sample_idx': sample_idx,
+            'token_position': current_position,
+            'remaining_tokens': remaining_tokens
+        }
         
+        # Add predictions from each layer
         for layer, pred in step_preds.items():
-            # Record prediction
             pred_value = pred.item() if isinstance(pred.item(), (int, float)) else pred.item()[0]
-            layer_step_preds[layer].append(pred_value)
+            row[f"{layer}_prediction"] = pred_value
+            row[f"{layer}_error"] = abs(pred_value - remaining_tokens)
+        
+        rows.append(row)
+    
+    # Write to CSV
+    if rows:
+        with open(filename, 'w', newline='') as csvfile:
+            fieldnames = rows[0].keys()
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+    
+    return filename
+
+def log_simplified_metrics_to_wandb(regression_outputs, initial_length, final_length, global_step, epoch):
+    """
+    Log only beginning and midpoint metrics to wandb.
+    Args:
+        regression_outputs: List of dictionaries with regression outputs for each step
+        initial_length: Starting token count (prompt length)
+        final_length: Final token count after generation
+        global_step: Current global training step 
+        epoch: Current epoch
+    """
+    if not regression_outputs:
+        return
+    
+    num_layers = len([k for k in regression_outputs[0].keys() if k.startswith("layer_")])
+    num_steps = len(regression_outputs)
+    
+    # Only log metrics at the beginning and midpoint
+    log_points = []
+    
+    # First token position (index 0)
+    if num_steps > 0:
+        log_points.append(0)
+    
+    # Midpoint token position
+    if num_steps > 1:
+        midpoint_idx = num_steps // 2
+        log_points.append(midpoint_idx)
+    
+    # Extract and log the metrics
+    for point_idx in log_points:
+        if point_idx < len(regression_outputs):
+            step_preds = regression_outputs[point_idx]
+            current_position = initial_length + point_idx
+            remaining_tokens = final_length - current_position
             
-            # Calculate and record absolute error
-            abs_error = abs(pred_value - remaining_tokens)
-            layer_step_errors[layer].append(abs_error)
-    
-    # Calculate average error by layer
-    layer_avg_errors = {layer: sum(errors)/len(errors) if errors else 0 
-                       for layer, errors in layer_step_errors.items()}
-    
-    # Calculate average error by step position 
-    # (average across all layers for each step)
-    step_avg_errors = []
-    for step_idx in range(num_steps):
-        step_error = 0
-        count = 0
-        for layer in layer_step_errors:
-            if step_idx < len(layer_step_errors[layer]):
-                step_error += layer_step_errors[layer][step_idx]
-                count += 1
-        step_avg_errors.append(step_error / count if count > 0 else 0)
-    
-    # Log summary metrics
-    wandb.log({
-        "avg_error_by_layer": wandb.Table(
-            columns=["Layer", "Average Absolute Error"],
-            data=[[layer, error] for layer, error in layer_avg_errors.items()]
-        ),
-        "avg_error_by_position": wandb.Table(
-            columns=["Position", "Target", "Average Absolute Error"],
-            data=[[pos, target, error] for pos, target, error in zip(step_positions, step_targets, step_avg_errors)]
-        ),
-        "step": global_step,
-        "epoch": epoch,
-    })
-    
-    # Log detailed plots
-    
-    # 1. Prediction accuracy by layer across generation steps
-    for layer in layer_step_errors:
-        error_data = [[pos, error] for pos, error in zip(step_positions, layer_step_errors[layer])]
-        wandb.log({
-            f"{layer}_errors_by_step": wandb.Table(
-                columns=["Position", "Error"],
-                data=error_data
-            ),
-            "step": global_step,
-            "epoch": epoch,
-        })
-    
-    # 2. Actual vs Predicted remaining tokens at each step for each layer
-    for layer in layer_step_preds:
-        pred_vs_actual = [[pos, target, pred] for pos, target, pred in 
-                          zip(step_positions, step_targets, layer_step_preds[layer])]
-        wandb.log({
-            f"{layer}_pred_vs_actual": wandb.Table(
-                columns=["Position", "Actual Remaining", f"{layer} Prediction"],
-                data=pred_vs_actual
-            ),
-            "step": global_step,
-            "epoch": epoch,
-        })
-    
-    # 3. Heatmap of all layers' errors across all steps - using Table instead of heatmap
-    heatmap_data = []
-    for i in range(num_layers):
-        for j in range(num_steps):
-            if j < len(layer_step_errors[f"layer_{i}"]):
-                heatmap_data.append([f"Layer {i}", f"Pos {step_positions[j]}", layer_step_errors[f"layer_{i}"][j]])
-            else:
-                heatmap_data.append([f"Layer {i}", f"Pos {step_positions[j]}", 0])
-    
-    wandb.log({
-        "layer_step_error_table": wandb.Table(
-            columns=["Layer", "Position", "Error"],
-            data=heatmap_data
-        ),
-        "step": global_step,
-        "epoch": epoch,
-    })
-    
-    # 4. Compare all layers' predictions at each step
-    for step_idx, pos in enumerate(step_positions):
-        if step_idx < num_steps:
-            step_preds_by_layer = []
-            for i in range(num_layers):
-                layer = f"layer_{i}"
-                if step_idx < len(layer_step_preds[layer]):
-                    step_preds_by_layer.append([f"Layer {i}", layer_step_preds[layer][step_idx]])
-                else:
-                    step_preds_by_layer.append([f"Layer {i}", 0])
+            point_name = "beginning" if point_idx == 0 else "midpoint"
             
+            # Log each layer's prediction and error at this point
+            layer_metrics = {}
+            for layer, pred in step_preds.items():
+                pred_value = pred.item() if isinstance(pred.item(), (int, float)) else pred.item()[0]
+                error = abs(pred_value - remaining_tokens)
+                
+                layer_metrics[f"{layer}_{point_name}_prediction"] = pred_value
+                layer_metrics[f"{layer}_{point_name}_error"] = error
+                layer_metrics[f"{point_name}_token_position"] = current_position
+                layer_metrics[f"{point_name}_remaining_tokens"] = remaining_tokens
+            
+            # Log to wandb
             wandb.log({
-                f"step_{step_idx}_position_{pos}_layer_predictions": wandb.Table(
-                    columns=["Layer", "Prediction"],
-                    data=step_preds_by_layer
-                ),
+                **layer_metrics,
                 "step": global_step,
-                "epoch": epoch,
+                "epoch": epoch
             })
 
 def main():
@@ -174,6 +153,9 @@ def main():
     # Output files for generated text
     train_outputs_file = config.get("train_outputs_file", "outputs/train_generations.jsonl")
     val_outputs_file = config.get("val_outputs_file", "outputs/val_generations.jsonl")
+    
+    # CSV log directory
+    csv_log_dir = config.get("csv_log_dir", "logs/token_data")
     
     # Scheduler parameters
     scheduler_type = config.get("scheduler_type", "cosine")
@@ -282,8 +264,8 @@ def main():
             final_length = generated_ids.size(1)
             total_train_loss += loss.item()
             
-            # Log detailed per-step and per-layer metrics
-            log_step_losses_to_wandb(
+            # Log simplified metrics to wandb (beginning and midpoint only)
+            log_simplified_metrics_to_wandb(
                 regression_outputs, 
                 initial_length, 
                 final_length,
@@ -291,54 +273,17 @@ def main():
                 epoch + 1
             )
             
-            # Log gradient information
-            for layer, layer_grads in gradient_data.items():
-                if layer_grads:  # Only log if we have gradient data for this layer
-                    # Convert to table format
-                    grad_data = []
-                    for item in layer_grads:
-                        grad_data.append([
-                            item['position'], 
-                            item['target'], 
-                            item['prediction'],
-                            item['loss'],
-                            item['gradient_norm']
-                        ])
-                    
-                    # Log as table
-                    wandb.log({
-                        f"{layer}_gradient_data": wandb.Table(
-                            columns=["Position", "Target", "Prediction", "Loss", "Gradient Norm"],
-                            data=grad_data
-                        ),
-                        "step": global_step,
-                        "epoch": epoch + 1
-                    })
-            
-            # Visualize loss distribution across steps and layers - using Table instead of heatmap
-            if step_layer_losses:
-                step_positions = [initial_length + step_idx for step_idx in step_layer_losses.keys()]
-                layer_indices = range(model.num_layers)
-                
-                # Create data for table
-                heatmap_data = []
-                for step_idx in step_layer_losses.keys():
-                    position = initial_length + step_idx
-                    for layer_idx in layer_indices:
-                        layer_key = f"layer_{layer_idx}"
-                        loss_value = 0.0
-                        if layer_key in step_layer_losses[step_idx]:
-                            loss_value = step_layer_losses[step_idx][layer_key]
-                        heatmap_data.append([f"Layer {layer_idx}", f"Pos {position}", loss_value])
-                
-                wandb.log({
-                    "step_layer_loss_table": wandb.Table(
-                        columns=["Layer", "Position", "Loss"],
-                        data=heatmap_data
-                    ),
-                    "step": global_step,
-                    "epoch": epoch + 1
-                })
+            # Save detailed per-token data to CSV
+            csv_filename = save_step_data_to_csv(
+                regression_outputs,
+                initial_length,
+                final_length,
+                global_step,
+                epoch + 1,
+                idx,
+                csv_dir=csv_log_dir
+            )
+            print(f"  Saved detailed token data to {csv_filename}")
             
             # Save generated text to file
             generation_data = {
@@ -350,7 +295,8 @@ def main():
                 "loss": loss.item(),
                 "layer_losses": {k: v for k, v in layer_losses.items()},
                 "frozen_layers": {k: v for k, v in frozen_layers.items()},
-                "timestamp": datetime.now().isoformat()
+                "timestamp": datetime.now().isoformat(),
+                "csv_data_file": csv_filename
             }
             save_generation_to_file(train_outputs_file, generation_data)
             
@@ -423,7 +369,8 @@ def main():
                 avg_val_loss, avg_val_layer_losses, val_generations = run_validation_with_save(
                     model, tokenizer, val_prompts, device, 
                     max_new_tokens, beam_width, top_k, top_p,
-                    val_outputs_file, epoch, global_step
+                    val_outputs_file, epoch, global_step,
+                    csv_log_dir=csv_log_dir
                 )
                 
                 # Log metrics table row
@@ -561,7 +508,8 @@ def main():
             avg_val_loss, avg_val_layer_losses, val_generations = run_validation_with_save(
                 model, tokenizer, val_prompts, device, 
                 max_new_tokens, beam_width, top_k, top_p,
-                val_outputs_file, epoch, global_step
+                val_outputs_file, epoch, global_step,
+                csv_log_dir=csv_log_dir
             )
             
             # Get current learning rate
