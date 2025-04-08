@@ -71,61 +71,69 @@ def save_step_data_to_csv(regression_outputs, initial_length, final_length, glob
     
     return filename
 
-def log_simplified_metrics_to_wandb(regression_outputs, initial_length, final_length, global_step, epoch):
+def log_simplified_metrics_to_wandb(regression_outputs, initial_length, final_length, global_step, epoch, frozen_layers=None):
     """
-    Log only beginning and midpoint metrics to wandb.
-    Metrics are logged without prompt indices to facilitate aggregation.
+    Log only beginning and midpoint metrics to wandb with simplified naming.
+    Only logs for active (non-frozen) layers.
     Args:
         regression_outputs: List of dictionaries with regression outputs for each step
         initial_length: Starting token count (prompt length)
         final_length: Final token count after generation
         global_step: Current global training step 
         epoch: Current epoch
+        frozen_layers: Dictionary indicating which layers are frozen
     """
-    if not regression_outputs:
+    if not regression_outputs or len(regression_outputs) == 0:
         return
     
-    num_layers = len([k for k in regression_outputs[0].keys() if k.startswith("layer_")])
+    if frozen_layers is None:
+        frozen_layers = {}
+    
     num_steps = len(regression_outputs)
     
     # Only log metrics at the beginning and midpoint
-    log_points = []
+    positions = []
+    position_names = []
     
-    # First token position (index 0)
+    # Beginning (first token)
     if num_steps > 0:
-        log_points.append(0)
+        positions.append(0)
+        position_names.append("start")
     
     # Midpoint token position
     if num_steps > 1:
         midpoint_idx = num_steps // 2
-        log_points.append(midpoint_idx)
+        positions.append(midpoint_idx)
+        position_names.append("mid")
     
-    # Extract and log the metrics
-    for point_idx in log_points:
-        if point_idx < len(regression_outputs):
-            step_preds = regression_outputs[point_idx]
-            current_position = initial_length + point_idx
+    # Prepare metrics to log
+    metrics_to_log = {}
+    
+    # Extract metrics for each position
+    for idx, (pos_idx, pos_name) in enumerate(zip(positions, position_names)):
+        if pos_idx < len(regression_outputs):
+            step_preds = regression_outputs[pos_idx]
+            current_position = initial_length + pos_idx
             remaining_tokens = final_length - current_position
             
-            point_name = "beginning" if point_idx == 0 else "midpoint"
-            
-            # Log each layer's prediction and error at this point
-            layer_metrics = {}
+            # Calculate error for each layer
             for layer, pred in step_preds.items():
+                # Skip frozen layers
+                layer_idx = int(layer.split('_')[1])
+                if frozen_layers.get(f"layer_{layer_idx}", False):
+                    continue
+                
                 pred_value = pred.item() if isinstance(pred.item(), (int, float)) else pred.item()[0]
                 error = abs(pred_value - remaining_tokens)
                 
-                layer_metrics[f"{layer}_{point_name}_prediction"] = pred_value
-                layer_metrics[f"{layer}_{point_name}_error"] = error
-                layer_metrics[f"{point_name}_position"] = current_position
-                layer_metrics[f"{point_name}_remaining_tokens"] = remaining_tokens
-            
-            # Log to wandb
-            wandb.log({
-                **layer_metrics,
-                "step": global_step,
-                "epoch": epoch
-            })
+                # Use simplified naming convention
+                metrics_to_log[f"train_layer_{layer_idx}_loss_{pos_name}"] = error
+    
+    # Log to wandb if we have metrics
+    if metrics_to_log:
+        metrics_to_log["step"] = global_step
+        metrics_to_log["epoch"] = epoch
+        wandb.log(metrics_to_log)
 
 def main():
     parser = argparse.ArgumentParser(description="Train regression heads to predict output token count.")
@@ -273,7 +281,8 @@ def main():
                 initial_length, 
                 final_length,
                 global_step,
-                epoch + 1
+                epoch + 1,
+                frozen_layers
             )
             
             # Save detailed per-token data to CSV
@@ -373,7 +382,8 @@ def main():
                     model, tokenizer, val_prompts, device, 
                     max_new_tokens, beam_width, top_k, top_p,
                     val_outputs_file, epoch, global_step,
-                    csv_log_dir=csv_log_dir
+                    csv_log_dir=csv_log_dir,
+                    frozen_layers=frozen_layers
                 )
                 
                 # Log metrics table row
@@ -512,7 +522,8 @@ def main():
                 model, tokenizer, val_prompts, device, 
                 max_new_tokens, beam_width, top_k, top_p,
                 val_outputs_file, epoch, global_step,
-                csv_log_dir=csv_log_dir
+                csv_log_dir=csv_log_dir,
+                frozen_layers=frozen_layers
             )
             
             # Get current learning rate

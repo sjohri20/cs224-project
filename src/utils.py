@@ -57,57 +57,63 @@ def save_validation_data_to_csv(regression_outputs, initial_length, final_length
     
     return filename
 
-def log_validation_simplified_metrics(regression_outputs, initial_length, final_length, global_step, epoch, prompt_idx):
+def log_validation_simplified_metrics(regression_outputs, initial_length, final_length, global_step, epoch, prompt_idx, frozen_layers=None):
     """
-    Log only beginning and midpoint validation metrics to wandb.
-    Instead of logging with prompt index, we'll accumulate metrics in wandb.
+    Log only start and mid validation metrics to wandb with simplified naming.
+    Only logs for active (non-frozen) layers.
     """
-    if not regression_outputs:
+    if not regression_outputs or len(regression_outputs) == 0:
         return
     
-    num_layers = len([k for k in regression_outputs[0].keys() if k.startswith("layer_")])
+    if frozen_layers is None:
+        frozen_layers = {}
+    
     num_steps = len(regression_outputs)
     
     # Only log metrics at the beginning and midpoint
-    log_points = []
+    positions = []
+    position_names = []
     
-    # First token position (index 0)
+    # Beginning (first token)
     if num_steps > 0:
-        log_points.append(0)
+        positions.append(0)
+        position_names.append("start")
     
     # Midpoint token position
     if num_steps > 1:
         midpoint_idx = num_steps // 2
-        log_points.append(midpoint_idx)
+        positions.append(midpoint_idx)
+        position_names.append("mid")
     
-    # Extract and log the metrics
-    for point_idx in log_points:
-        if point_idx < len(regression_outputs):
-            step_preds = regression_outputs[point_idx]
-            current_position = initial_length + point_idx
+    # Prepare metrics to log
+    metrics_to_log = {}
+    
+    # Extract metrics for each position
+    for idx, (pos_idx, pos_name) in enumerate(zip(positions, position_names)):
+        if pos_idx < len(regression_outputs):
+            step_preds = regression_outputs[pos_idx]
+            current_position = initial_length + pos_idx
             remaining_tokens = final_length - current_position
             
-            point_name = "beginning" if point_idx == 0 else "midpoint"
-            
-            # Log each layer's prediction and error at this point
-            layer_metrics = {}
+            # Calculate error for each layer
             for layer, pred in step_preds.items():
+                # Skip frozen layers
+                layer_idx = int(layer.split('_')[1])
+                if frozen_layers.get(f"layer_{layer_idx}", False):
+                    continue
+                
                 pred_value = pred.item() if isinstance(pred.item(), (int, float)) else pred.item()[0]
                 error = abs(pred_value - remaining_tokens)
                 
-                # Remove prompt_idx from metric names to aggregate properly
-                layer_metrics[f"{layer}_{point_name}_prediction"] = pred_value
-                layer_metrics[f"{layer}_{point_name}_error"] = error
-                layer_metrics[f"{point_name}_position"] = current_position
-                layer_metrics[f"{point_name}_remaining_tokens"] = remaining_tokens
-            
-            # Log to wandb
-            wandb.log({
-                **layer_metrics,
-                "step": global_step,
-                "epoch": epoch
-            })
-
+                # Use simplified naming convention
+                metrics_to_log[f"val_layer_{layer_idx}_loss_{pos_name}"] = error
+    
+    # Log to wandb if we have metrics
+    if metrics_to_log:
+        metrics_to_log["step"] = global_step
+        metrics_to_log["epoch"] = epoch
+        wandb.log(metrics_to_log)
+    
     return
 
 def save_generation_to_file(file_path, data):
@@ -226,7 +232,7 @@ def run_validation(model, tokenizer, val_prompts, device, max_new_tokens, beam_w
 
 def run_validation_with_save(model, tokenizer, val_prompts, device, max_new_tokens, 
                             beam_width, top_k, top_p, output_file, epoch, global_step,
-                            csv_log_dir="logs/val_token_data"):
+                            csv_log_dir="logs/val_token_data", frozen_layers=None):
     """
     Runs validation and saves generated text to a file.
     Returns validation loss metrics and a list of generations.
@@ -264,7 +270,8 @@ def run_validation_with_save(model, tokenizer, val_prompts, device, max_new_toke
                 final_length,
                 global_step,
                 epoch + 1,
-                idx
+                idx,
+                frozen_layers
             )
             
             # Save detailed data to CSV
