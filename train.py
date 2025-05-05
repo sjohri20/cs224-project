@@ -298,7 +298,7 @@ def main():
                 idx,
                 csv_dir=csv_log_dir
             )
-            print(f"  Saved detailed token data to {csv_filename}")
+            print(f"Saved detailed token data to {csv_filename}")
             
             # Save generated text to file
             generation_data = {
