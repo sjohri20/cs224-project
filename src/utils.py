@@ -114,7 +114,9 @@ def run_validation(model, tokenizer, val_prompts, device, max_new_tokens, beam_w
                 max_new_tokens,
                 beam_width=beam_width,
                 top_k=top_k,
-                top_p=top_p
+                top_p=top_p,
+                unique_datapoint_id=idx,
+                prompt=prompt
             )
             
             final_length = generated_ids.size(1)
@@ -203,7 +205,9 @@ def run_validation_with_save(model, tokenizer, val_prompts, device, max_new_toke
                 max_new_tokens,
                 beam_width=beam_width,
                 top_k=top_k,
-                top_p=top_p
+                top_p=top_p,
+                unique_datapoint_id=idx,
+                prompt=prompt
             )
             
             generated_text = tokenizer.decode(generated_ids[0])

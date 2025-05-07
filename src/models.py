@@ -1,3 +1,6 @@
+import os
+import json
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -35,15 +38,62 @@ class ModelWithRegressorForLM(nn.Module):
         self.hidden_size = self.model.config.hidden_size
         self.num_layers = self.model.config.num_hidden_layers
         self.include_token_count = include_token_count
+        self.model_name = model_name
         # Effective input dimension: add 1 if including token count.
         effective_dim = self.hidden_size + (1 if self.include_token_count else 0)
         self.regression_heads = nn.ModuleList([
             RegressionHead(effective_dim) for _ in range(self.num_layers)
         ])
         self.eos_token_id = self.model.config.eos_token_id
+    def save_generation_step_metadata(self, metadata, step, hidden_states, output_dir):
+        """
+        metadata: dict with keys: 'datapoint_id', 'prompt_text', 'generated_text',
+                  'tokens_generated', 'tokens_remaining'
+        hidden_states: list of tensors (1 per layer) for a single datapoint
+        """
+        os.makedirs(output_dir, exist_ok=True)
 
+        metadata_file = os.path.join(output_dir, "metadata.jsonl")
+        # Save all layers' hidden states in one file
+        hs_path = os.path.join(
+            output_dir,
+            f"hidden_step{step:04d}_{metadata['datapoint_id']}.npz"
+        )
+        # Convert list of tensors to numpy arrays and stack them
+        hidden_states_np = np.stack([hs.cpu().numpy() for hs in hidden_states])
+        np.savez(hs_path, hidden_states=hidden_states_np)
+        
+        # Write metadata entry for each layer
+        with open(metadata_file, "a") as f:
+            for layer_id in range(len(hidden_states)):
+                item = metadata.copy()
+                item["hidden_states_file"] = hs_path
+                item["step"] = step
+                item["layer_id"] = layer_id
+                f.write(json.dumps(item) + "\n")
+                
+    def update_saved_metadata(self, unique_datapoint_id, final_length, output_dir):
+        """
+        unique_datapoint_id: ID of the datapoint whose metadata is being updated
+        total_steps: total number of steps in the final generated output
+        """
+        
+        with open(os.path.join(output_dir, "metadata.jsonl"), "r") as f:
+            content = f.read()
+            metadata_list = [json.loads(line) for line in content.splitlines() if line.strip()]
+            updated_lines = []
+            for metadata in metadata_list:
+                if metadata.get("datapoint_id") == unique_datapoint_id:
+                    metadata["final_steps"] = final_length
+                    updated_lines.append(json.dumps(metadata))
+                else:
+                    updated_lines.append(json.dumps(metadata))
+
+        # Write back
+        with open(os.path.join(output_dir, "metadata.jsonl"), "w") as f:
+            f.write("\n".join(updated_lines) + "\n")
     def generate_with_regression(self, input_ids, attention_mask, max_new_tokens=10,
-                                 beam_width=1, top_k=0, top_p=0.0):
+                                 beam_width=1, top_k=0, top_p=0.0, unique_datapoint_id=None, prompt=None):
         """
         Autoregressively generates tokens while collecting regression outputs.
         At each step, each regression head receives the last token's hidden state,
@@ -75,6 +125,15 @@ class ModelWithRegressorForLM(nn.Module):
                         input_to_regressor = torch.cat([hidden_state, token_count_tensor], dim=-1)
                     else:
                         input_to_regressor = hidden_state
+                    metadata = {
+                            "datapoint_id": unique_datapoint_id,
+                            "prompt_text": prompt,
+                            "model_name": self.model_name,
+                            "steps_taken": step + 1,
+                            "layer": i,
+                            #"tokens_remaining": predicted_remaining_tokens[i],
+                        }
+                    self.save_generation_step_metadata(metadata, step, last_token_hidden_states, "saved_embeddings")
                     # Predict remaining tokens (instead of total length)
                     reg_out = self.regression_heads[i](input_to_regressor)  # [batch_size, 1]
                     step_regression_outputs[f"layer_{i}"] = reg_out
@@ -96,8 +155,10 @@ class ModelWithRegressorForLM(nn.Module):
                 
                 # Early stopping if EOS is generated.
                 if (next_token == self.eos_token_id).all():
+                    # Decode the entire sequence when EOS is encountered
                     break
-                    
+            print("Final step: ", step)
+            self.update_saved_metadata(unique_datapoint_id, step, "saved_embeddings")     
             return generated_ids, regression_outputs_per_step
         
         else:
@@ -162,7 +223,7 @@ class ModelWithRegressorForLM(nn.Module):
             return best_beam["sequence"], best_beam["regression_outputs"]
 
     def train_regressor_on_prompt(self, input_ids, attention_mask, max_new_tokens, optimizer,
-                                  beam_width=1, top_k=0, top_p=0.0):
+                                  beam_width=1, top_k=0, top_p=0.0, unique_datapoint_id=None, prompt=None):
         """
         Generates an output given a prompt and computes regression loss.
         The target for every regression head at every generation step is the remaining number of tokens
@@ -171,8 +232,9 @@ class ModelWithRegressorForLM(nn.Module):
         If a regression head is frozen (requires_grad=False), it will be excluded from loss calculation.
         """
         generated_ids, regression_outputs = self.generate_with_regression(
-            input_ids, attention_mask, max_new_tokens, beam_width, top_k, top_p
+            input_ids, attention_mask, max_new_tokens, beam_width, top_k, top_p, unique_datapoint_id, prompt,  
         )
+        
         final_length = generated_ids.size(1)
         initial_length = input_ids.size(1)
         

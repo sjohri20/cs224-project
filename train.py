@@ -251,6 +251,9 @@ def main():
             prompt = row['prompt']  # Assuming 'prompt' is the column name
             print(f"Processing training prompt {idx+1}/{len(train_prompts)}: {prompt[:50]}...")
             
+            # Generate unique ID for the datapoint
+            unique_id = f"train_{idx}"
+            
             # Before training, freeze gradient flow for frozen layers
             for layer_idx in range(model.num_layers):
                 layer_name = f"layer_{layer_idx}"
@@ -263,7 +266,6 @@ def main():
             
             inputs = tokenizer(prompt, return_tensors="pt").to(device)
             initial_length = inputs["input_ids"].size(1)
-            
             generated_ids, regression_outputs, loss, layer_losses, step_layer_losses, gradient_data = model.train_regressor_on_prompt(
                 inputs["input_ids"],
                 inputs["attention_mask"],
@@ -271,10 +273,13 @@ def main():
                 optimizer,
                 beam_width=beam_width,
                 top_k=top_k,
-                top_p=top_p
+                top_p=top_p,
+                unique_datapoint_id=unique_id,
+                prompt=prompt
             )
             
             generated_text = tokenizer.decode(generated_ids[0])
+            print("generated text: ", generated_text)
             final_length = generated_ids.size(1)
             total_train_loss += loss.item()
             

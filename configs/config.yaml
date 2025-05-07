@@ -2,7 +2,7 @@ model_name: "meta-llama/Meta-Llama-3-8B-Instruct"
 prompt_train: "data/alpaca_train.csv"
 prompt_val: "data/alpaca_val.csv"
 prompt_test: "data/alpaca_test.csv"
-max_new_tokens: 10
+max_new_tokens: 100
 beam_width: 1
 top_k: 50
 top_p: 0.9
