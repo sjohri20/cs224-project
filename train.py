@@ -178,7 +178,7 @@ def main():
     warmup_steps = config.get("warmup_steps", 0)
     
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = ModelWithRegressorForLM(model_name, include_token_count=include_token_count).to(device)
+    model = ModelWithRegressorForLM(model_name, tokenizer, include_token_count=include_token_count).to(device)
 
     wandb.init(project=config.get("wandb_project"), 
                entity = config.get("wandb_entity"), 

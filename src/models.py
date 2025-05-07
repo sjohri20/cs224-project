@@ -32,13 +32,14 @@ class ModelWithRegressorForLM(nn.Module):
     
     The language model is frozen (eval mode) so that only the regression heads are updated.
     """
-    def __init__(self, model_name, include_token_count=False):
+    def __init__(self, model_name, tokenizer, include_token_count=False):
         super().__init__()
         self.model = AutoModelForCausalLM.from_pretrained(model_name, output_hidden_states=True)
         self.hidden_size = self.model.config.hidden_size
         self.num_layers = self.model.config.num_hidden_layers
         self.include_token_count = include_token_count
         self.model_name = model_name
+        self.tokenizer = tokenizer
         # Effective input dimension: add 1 if including token count.
         effective_dim = self.hidden_size + (1 if self.include_token_count else 0)
         self.regression_heads = nn.ModuleList([
@@ -63,16 +64,12 @@ class ModelWithRegressorForLM(nn.Module):
         hidden_states_np = np.stack([hs.cpu().numpy() for hs in hidden_states])
         np.savez(hs_path, hidden_states=hidden_states_np)
         
-        # Write metadata entry for each layer
         with open(metadata_file, "a") as f:
-            for layer_id in range(len(hidden_states)):
-                item = metadata.copy()
-                item["hidden_states_file"] = hs_path
-                item["step"] = step
-                item["layer_id"] = layer_id
-                f.write(json.dumps(item) + "\n")
+                metadata["hidden_states_file"] = hs_path
                 
-    def update_saved_metadata(self, unique_datapoint_id, final_length, output_dir):
+                f.write(json.dumps(metadata) + "\n")
+                
+    def update_saved_metadata(self, unique_datapoint_id, generated_text, final_length, output_dir):
         """
         unique_datapoint_id: ID of the datapoint whose metadata is being updated
         total_steps: total number of steps in the final generated output
@@ -85,6 +82,7 @@ class ModelWithRegressorForLM(nn.Module):
             for metadata in metadata_list:
                 if metadata.get("datapoint_id") == unique_datapoint_id:
                     metadata["final_steps"] = final_length
+                    metadata["generated_text"] = generated_text
                     updated_lines.append(json.dumps(metadata))
                 else:
                     updated_lines.append(json.dumps(metadata))
@@ -131,9 +129,12 @@ class ModelWithRegressorForLM(nn.Module):
                             "model_name": self.model_name,
                             "steps_taken": step + 1,
                             "layer": i,
-                            #"tokens_remaining": predicted_remaining_tokens[i],
+                            "top_k": top_k,
+                            "top_p": top_p,
+                            "beam_width": beam_width
                         }
-                    self.save_generation_step_metadata(metadata, step, last_token_hidden_states, "saved_embeddings")
+                    if step % 5 == 0:
+                        self.save_generation_step_metadata(metadata, step, last_token_hidden_states, "saved_embeddings")
                     # Predict remaining tokens (instead of total length)
                     reg_out = self.regression_heads[i](input_to_regressor)  # [batch_size, 1]
                     step_regression_outputs[f"layer_{i}"] = reg_out
@@ -158,7 +159,7 @@ class ModelWithRegressorForLM(nn.Module):
                     # Decode the entire sequence when EOS is encountered
                     break
             print("Final step: ", step)
-            self.update_saved_metadata(unique_datapoint_id, step, "saved_embeddings")     
+            self.update_saved_metadata(unique_datapoint_id,  self.tokenizer.decode(generated_ids[0]),step, "saved_embeddings")     
             return generated_ids, regression_outputs_per_step
         
         else:
