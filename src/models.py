@@ -1,6 +1,7 @@
 import os
 import json
 import numpy as np
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -46,10 +47,10 @@ class ModelWithRegressorForLM(nn.Module):
             RegressionHead(effective_dim) for _ in range(self.num_layers)
         ])
         self.eos_token_id = self.model.config.eos_token_id
-    def save_generation_step_metadata(self, metadata, step, hidden_states, output_dir):
+    def save_state_and_metadata(self, unique_datapoint_id, prompt, hidden_step, hidden_states, generated_text, final_steps, 
+        metadata={}, output_dir = "saved_embeddings", metadata_file = "metadata.jsonl"):
         """
-        metadata: dict with keys: 'datapoint_id', 'prompt_text', 'generated_text',
-                  'tokens_generated', 'tokens_remaining'
+        metadata: dict with other keys: top_k, top_p, etc.
         hidden_states: list of tensors (1 per layer) for a single datapoint
         """
         os.makedirs(output_dir, exist_ok=True)
@@ -58,38 +59,22 @@ class ModelWithRegressorForLM(nn.Module):
         # Save all layers' hidden states in one file
         hs_path = os.path.join(
             output_dir,
-            f"hidden_step{step:04d}_{metadata['datapoint_id']}.npz"
+            f"hidden_step{hidden_step:04d}_{unique_datapoint_id}.npz"
         )
         # Convert list of tensors to numpy arrays and stack them
         hidden_states_np = np.stack([hs.cpu().numpy() for hs in hidden_states])
         np.savez(hs_path, hidden_states=hidden_states_np)
         
         with open(metadata_file, "a") as f:
-                metadata["hidden_states_file"] = hs_path
+            metadata["datapoint_id"] = unique_datapoint_id
+            metadata["prompt"] = prompt
+            metadata["hidden_states_file"] = hs_path
+            metadata["hidden_step"] = hidden_step
+            metadata["generated_text"] = generated_text
+            metadata["final_steps"] = final_steps
+            print("Saving hidden states from step: ", hidden_step, ". Final steps: ", final_steps)
+            f.write(json.dumps(metadata) + "\n")
                 
-                f.write(json.dumps(metadata) + "\n")
-                
-    def update_saved_metadata(self, unique_datapoint_id, generated_text, final_length, output_dir):
-        """
-        unique_datapoint_id: ID of the datapoint whose metadata is being updated
-        total_steps: total number of steps in the final generated output
-        """
-        
-        with open(os.path.join(output_dir, "metadata.jsonl"), "r") as f:
-            content = f.read()
-            metadata_list = [json.loads(line) for line in content.splitlines() if line.strip()]
-            updated_lines = []
-            for metadata in metadata_list:
-                if metadata.get("datapoint_id") == unique_datapoint_id:
-                    metadata["final_steps"] = final_length
-                    metadata["generated_text"] = generated_text
-                    updated_lines.append(json.dumps(metadata))
-                else:
-                    updated_lines.append(json.dumps(metadata))
-
-        # Write back
-        with open(os.path.join(output_dir, "metadata.jsonl"), "w") as f:
-            f.write("\n".join(updated_lines) + "\n")
     def generate_with_regression(self, input_ids, attention_mask, max_new_tokens=10,
                                  beam_width=1, top_k=0, top_p=0.0, unique_datapoint_id=None, prompt=None):
         """
@@ -104,12 +89,17 @@ class ModelWithRegressorForLM(nn.Module):
             # Sampling mode.
             generated_ids = input_ids
             regression_outputs_per_step = []
+            hidden_states_to_save = None
+            hidden_states_to_save_step = None
             for step in range(max_new_tokens):
                 outputs = self.model(input_ids=generated_ids,
                                      attention_mask=attention_mask,
                                      output_hidden_states=True)
                 # For each transformer block (skip initial embeddings), extract last token's hidden state.
                 last_token_hidden_states = [h[:, -1, :] for h in outputs.hidden_states[1:]]
+                if random.random() <= 1/(step+1):
+                    hidden_states_to_save = last_token_hidden_states
+                    hidden_states_to_save_step = step
                 step_regression_outputs = {}
                 for i, hidden_state in enumerate(last_token_hidden_states):
                     # Optionally include the current token count.
@@ -123,18 +113,7 @@ class ModelWithRegressorForLM(nn.Module):
                         input_to_regressor = torch.cat([hidden_state, token_count_tensor], dim=-1)
                     else:
                         input_to_regressor = hidden_state
-                    metadata = {
-                            "datapoint_id": unique_datapoint_id,
-                            "prompt_text": prompt,
-                            "model_name": self.model_name,
-                            "steps_taken": step + 1,
-                            "layer": i,
-                            "top_k": top_k,
-                            "top_p": top_p,
-                            "beam_width": beam_width
-                        }
-                    if step % 5 == 0:
-                        self.save_generation_step_metadata(metadata, step, last_token_hidden_states, "saved_embeddings")
+                    
                     # Predict remaining tokens (instead of total length)
                     reg_out = self.regression_heads[i](input_to_regressor)  # [batch_size, 1]
                     step_regression_outputs[f"layer_{i}"] = reg_out
@@ -159,7 +138,15 @@ class ModelWithRegressorForLM(nn.Module):
                     # Decode the entire sequence when EOS is encountered
                     break
             print("Final step: ", step)
-            self.update_saved_metadata(unique_datapoint_id,  self.tokenizer.decode(generated_ids[0]),step, "saved_embeddings")     
+            metadata = {
+                            "top_k": top_k,
+                            "top_p": top_p,
+                            "beam_width": beam_width
+            }
+            generated_text =  self.tokenizer.decode(generated_ids[0])
+            self.save_state_and_metadata(
+                unique_datapoint_id, prompt, hidden_states_to_save_step, hidden_states_to_save, generated_text, step + 1, metadata
+            )     
             return generated_ids, regression_outputs_per_step
         
         else:
