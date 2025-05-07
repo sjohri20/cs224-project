@@ -2,13 +2,14 @@ model_name: "meta-llama/Meta-Llama-3-8B-Instruct"
 prompt_train: "data/alpaca_train.csv"
 prompt_val: "data/alpaca_val.csv"
 prompt_test: "data/alpaca_test.csv"
-max_new_tokens: 10
+max_new_tokens: 1024
 beam_width: 1
 top_k: 50
 top_p: 0.9
+batch_size: 32
 include_token_count: false
 lr: 0.000001
-early_stopping: 10
+early_stopping: 1000
 val_freq: 1000
 epochs: 10
 save_path: "checkpoints/regression_model.pt"

@@ -161,6 +161,107 @@ class ModelWithRegressorForLM(nn.Module):
             best_beam = max(beams, key=lambda x: x["score"])
             return best_beam["sequence"], best_beam["regression_outputs"]
 
+    def generate_with_regression_batch(self, input_ids_batch, attention_mask_batch, max_new_tokens=10,
+                                 beam_width=1, top_k=0, top_p=0.0):
+        """
+        Autoregressively generates tokens for a batch of prompts while collecting regression outputs.
+        Similar to generate_with_regression but explicitly designed for batch processing.
+        
+        Args:
+            input_ids_batch: Tensor of shape [batch_size, seq_len] containing input token ids
+            attention_mask_batch: Tensor of shape [batch_size, seq_len] containing attention masks
+            max_new_tokens: Maximum number of new tokens to generate
+            beam_width: Beam width for generation (currently only supports beam_width=1 for batches)
+            top_k: Top-k filtering parameter
+            top_p: Top-p filtering parameter
+            
+        Returns:
+            generated_ids_batch: Tensor of shape [batch_size, final_seq_len] with generated sequences
+            regression_outputs_per_step: List of dictionaries containing regression outputs for each step
+            finished_flags: Tensor indicating which sequences have completed generation
+        """
+        if beam_width != 1:
+            raise ValueError("Batched generation only supports beam_width=1 (sampling mode)")
+
+        device = input_ids_batch.device
+        batch_size = input_ids_batch.size(0)
+        
+        # Sampling mode for batch processing
+        generated_ids = input_ids_batch
+        attention_mask = attention_mask_batch
+        regression_outputs_per_step = []
+        
+        # Keep track of which sequences have completed generation (hit max_length or generated EOS)
+        # Initially, all sequences are active
+        finished_flags = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        
+        for step in range(max_new_tokens):
+            # Skip if all sequences have finished
+            if finished_flags.all():
+                break
+                
+            outputs = self.model(input_ids=generated_ids,
+                                 attention_mask=attention_mask,
+                                 output_hidden_states=True)
+                
+            # For each transformer block (skip initial embeddings), extract last token's hidden state
+            last_token_hidden_states = [h[:, -1, :] for h in outputs.hidden_states[1:]]
+            
+            step_regression_outputs = {}
+            for i, hidden_state in enumerate(last_token_hidden_states):
+                # Optionally include the current token count
+                if self.include_token_count:
+                    # Use the current sequence length as token count
+                    token_count = generated_ids.size(1)
+                    token_count_tensor = torch.full((batch_size, 1), 
+                                                   fill_value=token_count, 
+                                                   device=device, 
+                                                   dtype=hidden_state.dtype)
+                    input_to_regressor = torch.cat([hidden_state, token_count_tensor], dim=-1)
+                else:
+                    input_to_regressor = hidden_state
+                    
+                # Predict remaining tokens (instead of total length)
+                reg_out = self.regression_heads[i](input_to_regressor)  # [batch_size, 1]
+                step_regression_outputs[f"layer_{i}"] = reg_out
+                
+            regression_outputs_per_step.append(step_regression_outputs)
+            
+            logits = outputs.logits[:, -1, :]  # [batch_size, vocab_size]
+            
+            # Filter logits for each example
+            filtered_logits = []
+            for logit in logits:
+                filtered = top_k_top_p_filtering(logit.clone(), top_k=top_k, top_p=top_p)
+                filtered_logits.append(filtered.unsqueeze(0))
+            filtered_logits = torch.cat(filtered_logits, dim=0)
+            
+            # For finished sequences, replace logits with ones that will always select padding
+            if finished_flags.any():
+                # Create logits that will deterministically choose padding token
+                pad_logits = torch.full_like(filtered_logits, -float('inf'))
+                pad_logits[:, self.model.config.pad_token_id] = 0
+                # Apply only to finished sequences
+                filtered_logits = torch.where(
+                    finished_flags.unsqueeze(1).expand_as(filtered_logits),
+                    pad_logits,
+                    filtered_logits
+                )
+            
+            probs = F.softmax(filtered_logits, dim=-1)
+            
+            # Sample next token
+            next_token = torch.multinomial(probs, num_samples=1)  # [batch_size, 1]
+            generated_ids = torch.cat([generated_ids, next_token], dim=1)
+            
+            # Update attention mask
+            attention_mask = torch.ones_like(generated_ids)
+            
+            # Update finished flags: mark as finished if EOS token is generated
+            finished_flags = finished_flags | (next_token.squeeze(1) == self.eos_token_id)
+                
+        return generated_ids, regression_outputs_per_step, finished_flags
+
     def train_regressor_on_prompt(self, input_ids, attention_mask, max_new_tokens, optimizer,
                                   beam_width=1, top_k=0, top_p=0.0):
         """
@@ -267,3 +368,128 @@ class ModelWithRegressorForLM(nn.Module):
             optimizer.step()
         
         return generated_ids, regression_outputs, avg_loss, avg_layer_losses, step_layer_losses, gradient_data
+
+    def train_regressor_on_prompt_batch(self, input_ids_batch, attention_mask_batch, max_new_tokens, optimizer,
+                                       beam_width=1, top_k=0, top_p=0.0):
+        """
+        Processes a batch of prompts, generates outputs for each, and computes regression loss.
+        Handles variable-length completions and aggregates losses at the batch level.
+        
+        Args:
+            input_ids_batch: Tensor of shape [batch_size, seq_len] containing input token ids
+            attention_mask_batch: Tensor of shape [batch_size, seq_len] containing attention masks
+            max_new_tokens: Maximum number of new tokens to generate
+            optimizer: Optimizer to use for updating regression heads
+            beam_width: Beam width for generation (only beam_width=1 supported for batches)
+            top_k: Top-k filtering parameter
+            top_p: Top-p filtering parameter
+            
+        Returns:
+            generated_ids_batch: Tensor containing the generated sequences
+            regression_outputs_batch: Regression outputs for each step
+            avg_loss: Average loss across the batch
+            avg_layer_losses: Average loss per layer
+            step_layer_losses: Detailed loss information per step and layer
+            gradient_data: Gradient information for analysis
+        """
+        # Generate completions for all prompts in the batch
+        generated_ids_batch, regression_outputs_batch, finished_flags = self.generate_with_regression_batch(
+            input_ids_batch, attention_mask_batch, max_new_tokens, beam_width, top_k, top_p
+        )
+        
+        batch_size = input_ids_batch.size(0)
+        
+        # Get initial and final lengths for each item in the batch
+        initial_lengths = torch.full((batch_size,), input_ids_batch.size(1), dtype=torch.int, device=input_ids_batch.device)
+        final_lengths = torch.tensor([seq.size(1) for seq in generated_ids_batch.split(1)], device=input_ids_batch.device)
+        
+        # Calculate loss per layer
+        layer_losses = {}
+        step_layer_losses = {}  # Store losses by step and layer for detailed analysis
+        total_loss = 0.0
+        count = 0
+        
+        # Track gradients for analysis
+        gradient_data = {f"layer_{i}": [] for i in range(self.num_layers)}
+        
+        # Collect all losses before backpropagation
+        all_losses = []
+        
+        # Process each step in the generation
+        for step_idx, step_preds in enumerate(regression_outputs_batch):
+            # Track step-specific losses
+            if step_idx not in step_layer_losses:
+                step_layer_losses[step_idx] = {}
+            
+            # For each batch item, calculate appropriate targets based on final sequence length
+            for batch_idx in range(batch_size):
+                # Current position in the sequence for this batch item
+                current_position = initial_lengths[batch_idx] + step_idx
+                
+                # Skip if this position exceeds the final length for this batch item
+                if current_position >= final_lengths[batch_idx]:
+                    continue
+                
+                # Remaining tokens to be generated for this batch item
+                remaining_tokens = final_lengths[batch_idx] - current_position
+                target = torch.tensor(remaining_tokens, dtype=torch.float, device=generated_ids_batch.device)
+                
+                # Process each layer's prediction for this batch item
+                for layer, preds in step_preds.items():
+                    layer_idx = int(layer.split('_')[1])
+                    
+                    # Skip frozen layers
+                    if not any(p.requires_grad for p in self.regression_heads[layer_idx].parameters()):
+                        if layer not in layer_losses:
+                            layer_losses[layer] = 0.0
+                        if layer not in step_layer_losses[step_idx]:
+                            step_layer_losses[step_idx][layer] = 0.0
+                        continue
+                    
+                    # Extract prediction for this batch item
+                    pred = preds[batch_idx].unsqueeze(0)  # Ensure it's a tensor with shape [1, 1]
+                    
+                    # Calculate loss
+                    mse = F.mse_loss(pred.squeeze(-1), target.unsqueeze(0))
+                    
+                    # Store individual loss
+                    if layer not in step_layer_losses[step_idx]:
+                        step_layer_losses[step_idx][layer] = {}
+                    step_layer_losses[step_idx][layer][batch_idx] = mse.item()
+                    
+                    # Collect loss for batch accumulation
+                    all_losses.append(mse)
+                    
+                    # Track layer-specific losses
+                    if layer not in layer_losses:
+                        layer_losses[layer] = []
+                    layer_losses[layer].append(mse.item())
+                    
+                    count += 1
+        
+        # Combine all losses
+        if all_losses:
+            # Compute the mean loss
+            combined_loss = torch.mean(torch.stack(all_losses))
+            
+            # Backward pass and optimization
+            optimizer.zero_grad()
+            combined_loss.backward()
+            optimizer.step()
+            
+            total_loss = combined_loss.item()
+        else:
+            total_loss = 0.0
+        
+        # Average the losses
+        avg_loss = total_loss if not all_losses else total_loss
+        
+        # Calculate average loss per layer
+        avg_layer_losses = {}
+        for layer, losses in layer_losses.items():
+            if isinstance(losses, list) and losses:
+                avg_layer_losses[layer] = sum(losses) / len(losses)
+            else:
+                avg_layer_losses[layer] = losses  # Already a direct value (0.0)
+        
+        return generated_ids_batch, regression_outputs_batch, avg_loss, avg_layer_losses, step_layer_losses, gradient_data
